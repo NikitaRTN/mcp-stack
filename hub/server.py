@@ -34,6 +34,22 @@ _sessions_lock = threading.Lock()
 
 PUBLIC_PATHS = {"/api/session", "/api/auth/login", "/api/auth/setup", "/healthz"}
 
+# Windows builds can inherit a broken .js mapping from the registry and make
+# mimetypes.guess_type() return text/plain. Browsers reject ES modules served
+# with that MIME type, so web assets use deterministic types first.
+STATIC_CONTENT_TYPES = {
+    ".html": "text/html",
+    ".css": "text/css",
+    ".js": "application/javascript",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+}
+
 
 def new_session():
     token = secrets.token_urlsafe(32)
@@ -473,7 +489,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not target.exists():
                 return self.send_json(500, {"error": "Нет файлов интерфейса в web/"})
         data = target.read_bytes()
-        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        ctype = (STATIC_CONTENT_TYPES.get(target.suffix.lower())
+                 or mimetypes.guess_type(target.name)[0]
+                 or "application/octet-stream")
         if ctype.startswith("text/") or ctype in ("application/javascript", "application/json"):
             ctype += "; charset=utf-8"
         self.send_response(200)
