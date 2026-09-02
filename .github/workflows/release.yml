@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test
+        run: python -m unittest discover -s tests -v
+      - name: Build portable exe
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check pyinstaller==6.10.0
+          pyinstaller --noconfirm --clean --onefile --name MCP-Hub `
+            --add-data "web;web" `
+            --version-file packaging/windows-version.txt `
+            run.py
+          New-Item -ItemType Directory -Force release/MCP-Hub | Out-Null
+          Copy-Item dist/MCP-Hub.exe release/MCP-Hub/
+          Copy-Item README.md,RELEASE_NOTES.md,LICENSE release/MCP-Hub/
+          Compress-Archive -Path release/MCP-Hub -DestinationPath MCP-Hub-Windows-x64.zip
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MCP-Hub-Windows-x64
+          path: MCP-Hub-Windows-x64.zip
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MCP-Hub-Windows-x64.zip
+          body_path: RELEASE_NOTES.md

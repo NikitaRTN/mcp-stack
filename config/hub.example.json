@@ -1,0 +1,23 @@
+{
+  "version": 3,
+  "domain": "localhost",
+  "email": "",
+  "httpsPort": 8443,
+  "adminPort": 8765,
+  "inspectorPort": 8770,
+  "bind": "",
+  "telemetryDays": 14,
+  "autoRestart": true,
+  "openBrowser": true,
+  "firewall": { "rules": [] },
+  "services": [
+    { "id": "dc", "enabled": false },
+    { "id": "roblox", "enabled": false },
+    {
+      "id": "real",
+      "enabled": false,
+      "authMode": "token",
+      "upstreamAuthMode": "none"
+    }
+  ]
+}

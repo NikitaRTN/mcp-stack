@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark light" />
+<title>MCP Hub</title>
+<link rel="stylesheet" href="styles.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232783DE'/%3E%3Cpath d='M9 21V11l7 6 7-6v10' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+</head>
+<body>
+
+<!-- ===================== вход / первый запуск ===================== -->
+<section id="gate" class="gate is-hidden" aria-live="polite">
+  <form class="gate-card" id="gate-form" novalidate>
+    <div class="gate-logo" aria-hidden="true">MCP&nbsp;Hub</div>
+    <h1 id="gate-title">Вход в панель</h1>
+    <p class="gate-sub" id="gate-sub">Панель доступна только с этого компьютера или через ваш домен.</p>
+    <label class="field">Логин<input id="gate-user" value="admin" autocomplete="username" /></label>
+    <label class="field">Пароль<input id="gate-pass" type="password" autocomplete="current-password" /></label>
+    <label class="field is-hidden" id="gate-repeat-wrap">Повторите пароль<input id="gate-repeat" type="password" autocomplete="new-password" /></label>
+    <p class="gate-hint" id="gate-hint"></p>
+    <div class="inline-error is-hidden" id="gate-error" role="alert"></div>
+    <button class="btn primary wide" id="gate-go" type="submit">Войти</button>
+  </form>
+</section>
+
+<!-- ===================== панель ===================== -->
+<div id="app" class="app is-hidden">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">MCP</span>
+      <span class="brand-text">Hub <small id="app-version"></small></span>
+      <button class="icon-btn only-mobile" id="sidebar-close" aria-label="Закрыть меню">✕</button>
+    </div>
+
+    <nav id="nav" class="nav" aria-label="Разделы панели"></nav>
+
+    <div class="sidebar-foot">
+      <button class="live" id="live-indicator" type="button" title="Состояние потока событий. Нажмите, чтобы переподключиться">
+        <span class="live-dot" aria-hidden="true"></span><span id="live-text">подключение…</span>
+      </button>
+      <button class="btn ghost small wide" id="logout">Выйти</button>
+    </div>
+  </aside>
+  <div class="sidebar-scrim" id="sidebar-scrim" hidden></div>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="sidebar-open" aria-label="Открыть меню">☰</button>
+      <div class="topbar-title">
+        <h1 id="page-title">Обзор</h1>
+        <p id="page-sub" class="muted"></p>
+      </div>
+      <div class="topbar-actions">
+        <span class="chip" id="chip-domain" title="Адрес публикации"></span>
+        <button class="btn ghost small" id="btn-health">Проверить всё</button>
+        <button class="icon-btn" id="btn-refresh" title="Обновить состояние (R)" aria-label="Обновить">↻</button>
+        <button class="icon-btn" id="btn-theme" title="Светлая / тёмная тема" aria-label="Сменить тему">◐</button>
+      </div>
+    </header>
+
+    <div id="banners" class="banners" aria-live="polite"></div>
+    <div id="problems" class="problems is-hidden"></div>
+    <div id="view" class="view"></div>
+  </main>
+</div>
+
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+<!-- карточка вызова / записи журнала -->
+<div id="drawer" class="drawer is-hidden" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+  <div class="drawer-backdrop" data-close-drawer></div>
+  <div class="drawer-panel">
+    <div class="drawer-head">
+      <div>
+        <h2 id="drawer-title">Вызов</h2>
+        <p class="muted" id="drawer-sub"></p>
+      </div>
+      <div class="row-actions">
+        <button class="btn ghost small" id="drawer-copy">Копировать JSON</button>
+        <button class="icon-btn" data-close-drawer aria-label="Закрыть">✕</button>
+      </div>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </div>
+</div>
+
+<!-- подтверждение вместо window.confirm -->
+<div id="confirm" class="modal is-hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div class="modal-backdrop" data-confirm-cancel></div>
+  <div class="modal-card">
+    <h2 id="confirm-title">Подтвердите действие</h2>
+    <p id="confirm-text" class="muted"></p>
+    <div class="row-actions end">
+      <button class="btn ghost" data-confirm-cancel>Отмена</button>
+      <button class="btn danger" id="confirm-ok">Продолжить</button>
+    </div>
+  </div>
+</div>
+
+<noscript><p style="padding:24px">Для панели нужен JavaScript.</p></noscript>
+<script type="module" src="js/main.js?v=20260901-0250"></script>
+</body>
+</html>

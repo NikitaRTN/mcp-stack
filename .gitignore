@@ -1,0 +1,11 @@
+# Runtime state — never commit tokens, password hashes, logs or downloads
+/config/hub.json
+/config/*.broken.json
+/data/
+/logs/
+/bin/
+/Caddyfile
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
