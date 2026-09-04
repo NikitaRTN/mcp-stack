@@ -23,6 +23,13 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.DEFAULT_SERVICES)
         self.assertTrue(all(not s["enabled"] for s in config.DEFAULT_SERVICES))
 
+    def test_windows_automation_is_builtin_and_expands_command(self):
+        service = next(s for s in config.DEFAULT_SERVICES if s["id"] == "windows")
+        self.assertIn("windows", service["requires"])
+        command = config.expand_command(service)
+        self.assertIn("windows_mcp.cmd", command)
+        self.assertNotIn("{windowsMcp}", command)
+
     def test_disabled_services_have_no_caddy_route(self):
         text = caddyfile.render(self.sample())
         self.assertNotIn("handle /mcp*", text)

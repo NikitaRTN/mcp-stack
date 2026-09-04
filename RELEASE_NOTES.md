@@ -1,3 +1,11 @@
+# MCP Hub 3.4.0 Windows Automation
+
+- Добавлен встроенный Windows UI Automation MCP с 9 tools: окна, элементы, invoke/select/value, семантический клик, SendKeys, ожидание и PNG-скриншоты.
+- Desktop Commander обновлён с 0.2.47 до 0.2.48.
+- Windows MCP использует UTF-8 и остаётся выключенным по умолчанию.
+- Portable release теперь включает каталог `tools/`.
+- Добавлены проверки конфигурации, команды запуска и PowerShell smoke test.
+
 # MCP Hub 3.3.1 fixed-v4 OAuth
 
 - Добавлен встроенный OAuth Authorization Server для ChatGPT.

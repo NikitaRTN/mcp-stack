@@ -25,3 +25,10 @@ jobs:
       - name: JavaScript syntax
         if: runner.os == 'Linux'
         run: node --check web/app.js
+      - name: Windows MCP smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $request = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+          $response = $request | powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows_mcp.ps1
+          if (-not (($response | ConvertFrom-Json).result.tools.Count -ge 9)) { throw 'Windows MCP tools/list failed' }

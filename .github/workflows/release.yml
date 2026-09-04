@@ -28,6 +28,7 @@ jobs:
             run.py
           New-Item -ItemType Directory -Force release/MCP-Hub | Out-Null
           Copy-Item dist/MCP-Hub.exe release/MCP-Hub/
+          Copy-Item tools release/MCP-Hub/tools -Recurse
           Copy-Item README.md,RELEASE_NOTES.md,LICENSE release/MCP-Hub/
           Compress-Archive -Path release/MCP-Hub -DestinationPath MCP-Hub-Windows-x64.zip
       - name: Upload workflow artifact

@@ -46,10 +46,26 @@ DEFAULT_SERVICES = [
         "port": 8000,
         "upstreamPath": "/mcp",
         "command": (
-            "npx -y supergateway --stdio \"npx -y @wonderwhy-er/desktop-commander@0.2.47\" "
+            "npx -y supergateway --stdio \"npx -y @wonderwhy-er/desktop-commander@0.2.48\" "
             "--port {port} --outputTransport streamableHttp --stateful"
         ),
         "requires": ["node"],
+        "builtin": True,
+    },
+    {
+        "id": "windows",
+        "label": "Windows UI Automation",
+        "path": "/windows",
+        "note": "скриншоты, доступные элементы, клики и ввод без координат",
+        "kind": "stdio",
+        "enabled": False,
+        "port": 8002,
+        "upstreamPath": "/mcp",
+        "command": (
+            "npx -y supergateway --stdio \"{windowsMcp}\" "
+            "--port {port} --outputTransport streamableHttp --stateful"
+        ),
+        "requires": ["node", "windows"],
         "builtin": True,
     },
     {
@@ -436,9 +452,11 @@ def expand_command(svc):
     local = os.environ.get("LOCALAPPDATA")
     if local:
         roblox_bat = str(Path(local) / "Roblox" / "mcp.bat")
+    windows_mcp = str(ROOT / "tools" / "windows_mcp.cmd")
     return (svc.get("command") or "").format(
         port=int(svc.get("port") or 0),
         robloxBat=roblox_bat,
+        windowsMcp=windows_mcp,
     )
 
 

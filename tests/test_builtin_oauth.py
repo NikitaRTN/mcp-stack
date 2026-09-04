@@ -16,9 +16,10 @@ class BuiltinOAuthTests(unittest.TestCase):
                     "token": "test", "oauthSigningKey": "unit-signing-key"})
         for service in cfg["services"]:
             service["enabled"] = False
-        cfg["services"][1].update({"enabled": True, "authMode": "oauth",
-                                    "oauth": {"mode": "builtin",
-                                              "requiredScopes": "mcp:tools"}})
+        service = next(s for s in cfg["services"] if s["id"] == "roblox")
+        service.update({"enabled": True, "authMode": "oauth",
+                        "oauth": {"mode": "builtin",
+                                  "requiredScopes": "mcp:tools"}})
         return cfg
 
     def test_discovery_dcr_pkce_and_resource_binding(self):

@@ -12,6 +12,7 @@
   "firewall": { "rules": [] },
   "services": [
     { "id": "dc", "enabled": false },
+    { "id": "windows", "enabled": false },
     { "id": "roblox", "enabled": false },
     {
       "id": "real",

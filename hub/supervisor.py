@@ -119,8 +119,13 @@ def start_service(sid):
     command = config.expand_command(svc)
     if not command.strip():
         raise ValueError("У сервиса не задана команда запуска")
-    if "node" in (svc.get("requires") or []) and not processes.which("node"):
+    requires = svc.get("requires") or []
+    if "node" in requires and not processes.which("node"):
         raise ValueError("Нужен Node.js — установите его на вкладке «Компоненты»")
+    if "windows" in requires and not processes.IS_WINDOWS:
+        raise ValueError("Этот MCP доступен только в Windows")
+    if "windows" in requires and not (config.ROOT / "tools" / "windows_mcp.cmd").exists():
+        raise ValueError("Не найден tools/windows_mcp.cmd — переустановите MCP Hub")
     pid = processes.spawn(proc_name(sid), command)
     BUS.publish("service.changed", {"service": sid, "action": "start", "pid": pid})
     return pid
