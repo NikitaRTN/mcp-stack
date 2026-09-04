@@ -39,7 +39,13 @@ function renderProblems(){const host=clear($('#problems')),items=app.state.probl
 function renderOverview(host){title('Обзор','Состояние MCP Hub');renderProblems();const s=app.state,t=s.totals||{},services=s.services||[];const metrics=el('div.grid.cols-4',null,[metric('Включено',`${s.enabledCount||0} / ${services.length}`,'MCP-сервисов'),metric('Вызовы за час',fmtNum(t.calls1h||0),'все сервисы'),metric('Ошибки',fmtNum(t.failed1h||0),fmtPct(t.errorRate||0),t.failed1h?'bad':'ok'),metric('P95',fmtMs(t.p95Ms),'задержка')]);const serviceCards=services.map(v=>{const st=v.status?.state||'off';return el('button.card',{type:'button',onclick:()=>go('svc:'+v.id),style:{textAlign:'left',cursor:'pointer'}},[el('div.svc-head',null,[el('div.svc-title',null,[el('span.dot.'+st),el('div',null,[el('h2',{text:v.label||v.id}),el('p.muted',{text:v.status?.detail||v.note||''})])]),badge(v.enabled?(st==='up'?'работает':st):'выключен',st==='up'?'ok':v.enabled?'warn':'off')]),el('div.grid.cols-3',null,[metric('Вызовы',fmtNum(v.metrics?.calls1h||0),'1 час'),metric('Ошибки',fmtNum(v.metrics?.failed1h||0),'1 час'),metric('P95',fmtMs(v.metrics?.p95Ms),'')])])});clear(host).append(metrics,el('div.grid.cols-2',null,serviceCards.length?serviceCards:[empty('Сервисы ещё не добавлены')]))}
 
 function svcOpButton(label,method,id,kind='ghost'){return el('button.btn.'+kind+'.small',{type:'button',onclick:async e=>{try{await withBusy(e.currentTarget,()=>rpc(method,{id}));toast(label+' — готово','ok');refresh(true)}catch(x){reportError(x,label)}}},label)}
-function renderService(host,id){const s=(app.state.services||[]).find(x=>x.id===id);if(!s){go('overview');return}title(s.label||id,s.note||'MCP-сервис');const enabled=el('input',{type:'checkbox'});enabled.checked=!!s.enabled;enabled.onchange=async()=>{enabled.disabled=true;try{await rpc('service.setEnabled',{id,enabled:enabled.checked});toast(enabled.checked?'Сервис включён':'Сервис выключен','ok');refresh(true)}catch(e){enabled.checked=!enabled.checked;reportError(e)}finally{enabled.disabled=false}};const toggle=el('label.switch',null,[enabled,el('span.track'),el('span',{text:s.enabled?'Включён':'Выключен'})]);const edit=el('button.btn.ghost.small',{type:'button',onclick:()=>{selectStudioService(id);go('studio')}},'Редактировать в Studio');const actions=[toggle,edit,svcOpButton('Запустить','service.start',id),svcOpButton('Перезапустить','service.restart',id),svcOpButton('Остановить','service.stop',id,'danger')];const info=card('Состояние',s.status?.detail||'',actions,[el('div.grid.cols-3',null,[metric('Статус',s.status?.state||'—',''),metric('Вызовы / ч',fmtNum(s.metrics?.calls1h||0),'Ошибок '+fmtNum(s.metrics?.failed1h||0)),metric('Последний вызов',fmtAgo(s.metrics?.lastCallAt),'')]),s.url?el('div.url-row',null,[el('span.url',{text:s.url}),el('button.btn.ghost.small',{onclick:()=>copy(s.url)},'Копировать')]):null]);clear(host).append(info,el('div',{id:'svc-calls'}));app.view=mountCalls($('#svc-calls'),id)}
+function diagnosisBody(result,id){
+	const checks=el('div.diagnosis-checks',null,(result.checks||[]).map(item=>el('div.diagnosis-check.'+(item.status==='ok'?'ok':item.status==='skipped'?'warn':'bad'),null,[el('span.diagnosis-mark',{text:item.status==='ok'?'✓':item.status==='skipped'?'–':'!'}),el('div',null,[el('strong',{text:item.label||item.id}),el('p.muted',{text:item.detail||''})])])) )
+	const actions=(result.recovery||[]).map(action=>el('button.btn.'+(action.kind||'ghost'),{type:'button',onclick:async e=>{try{await withBusy(e.currentTarget,()=>rpc(action.method,action.params||{},{timeout:90000,retries:0}));toast(action.label+' — выполнено','ok');const fresh=await rpc('service.diagnose',{id,timeout:30},{timeout:160000,retries:0});openDrawer({title:'Диагностика цепочки',subtitle:fresh.summary,json:pretty(fresh),body:diagnosisBody(fresh,id)});refresh(true)}catch(error){reportError(error,action.label)}}},action.label))
+	return el('div.diagnosis-body',null,[el('div.diagnosis-summary.'+(result.ok?'ok':'bad'),null,[el('strong',{text:result.ok?'Цепочка исправна':'Найден сбой'}),el('span',{text:result.summary||''})]),checks,actions.length?el('div.recovery-box',null,[el('div',null,[el('strong',{text:'Быстрое исправление'}),el('p.muted',{text:(result.recovery||[])[0]?.detail||'Выполните рекомендуемое действие и повторите проверку.'})]),el('div.row-actions',null,actions)]):null,el('details.diagnosis-log',null,[el('summary',{text:'Технический журнал'}),el('pre.log',{text:result.logTail||'Журнал пуст'})])])
+}
+function diagnoseServiceButton(id,label){return el('button.btn.primary.small',{type:'button',onclick:async e=>{try{const result=await withBusy(e.currentTarget,()=>rpc('service.diagnose',{id,timeout:30},{timeout:160000,retries:0}));openDrawer({title:'Диагностика цепочки',subtitle:label||id,json:pretty(result),body:diagnosisBody(result,id)})}catch(x){reportError(x,'Диагностика цепочки')}}},'Проверить и исправить')}
+function renderService(host,id){const s=(app.state.services||[]).find(x=>x.id===id);if(!s){go('overview');return}title(s.label||id,s.note||'MCP-сервис');const enabled=el('input',{type:'checkbox'});enabled.checked=!!s.enabled;enabled.onchange=async()=>{enabled.disabled=true;try{await rpc('service.setEnabled',{id,enabled:enabled.checked});toast(enabled.checked?'Сервис включён':'Сервис выключен','ok');refresh(true)}catch(e){enabled.checked=!enabled.checked;reportError(e)}finally{enabled.disabled=false}};const toggle=el('label.switch',null,[enabled,el('span.track'),el('span',{text:s.enabled?'Включён':'Выключен'})]);const edit=el('button.btn.ghost.small',{type:'button',onclick:()=>{selectStudioService(id);go('studio')}},'Редактировать в Studio');const actions=[toggle,edit,diagnoseServiceButton(id,s.label),svcOpButton('Запустить','service.start',id),svcOpButton('Перезапустить','service.restart',id),svcOpButton('Остановить','service.stop',id,'danger')];const info=card('Состояние',s.status?.detail||'',actions,[el('div.grid.cols-3',null,[metric('Статус',s.status?.state||'—',''),metric('Вызовы / ч',fmtNum(s.metrics?.calls1h||0),'Ошибок '+fmtNum(s.metrics?.failed1h||0)),metric('Последний вызов',fmtAgo(s.metrics?.lastCallAt),'')]),s.url?el('div.url-row',null,[el('span.url',{text:s.url}),el('button.btn.ghost.small',{onclick:()=>copy(s.url)},'Копировать')]):null]);clear(host).append(info,el('div',{id:'svc-calls'}));app.view=mountCalls($('#svc-calls'),id)}
 
 const componentVisuals={
 	caddy:{icon:'C',group:'Сеть и HTTPS'},
@@ -52,6 +58,7 @@ const expandedComponents=new Set()
 const installState={
 	jobId:null,component:null,label:'',status:'idle',percent:0,lines:[],message:'',detail:'',
 	phase:'idle',indeterminate:false,downloadedBytes:0,totalBytes:0,speedBps:0,elapsedSec:0,
+	registry:'',errorKind:null,recovery:[],canCancel:false,
 	pollTimer:null,notifiedJob:null,dismissedJob:null,
 }
 
@@ -115,7 +122,7 @@ function applyInstallUpdate(event){
 	if(!event)return false
 	if(installState.jobId&&event.jobId&&event.jobId!==installState.jobId)return false
 	if(installState.status!=='running'&&installState.component&&event.component&&event.component!==installState.component)return false
-	for(const key of ['jobId','component','status','detail','phase','indeterminate','downloadedBytes','totalBytes','speedBps','elapsedSec'])if(event[key]!==undefined&&event[key]!==null)installState[key]=event[key]
+	for(const key of ['jobId','component','status','detail','phase','indeterminate','downloadedBytes','totalBytes','speedBps','elapsedSec','registry','errorKind','recovery','canCancel'])if(event[key]!==undefined&&event[key]!==null)installState[key]=event[key]
 	if(event.percent!==undefined&&event.percent!==null)installState.percent=event.percent
 	if(Array.isArray(event.lines))installState.lines=event.lines.slice(-200)
 	if(event.line&&!installState.lines.includes(event.line)){installState.lines.push(event.line);installState.lines=installState.lines.slice(-200)}
@@ -139,6 +146,10 @@ function inlineProgress(item){
 		el('div.progress.component-inline-bar',{role:'progressbar','aria-valuemin':'0','aria-valuemax':'100','aria-valuenow':'0'},el('i')),
 		el('div.component-inline-meta',{text:'Ожидание данных'}),
 	])
+}
+async function cancelInstall(button){
+	if(!installState.jobId||installState.status!=='running')return
+	try{await withBusy(button,()=>rpc('install.cancel',{jobId:installState.jobId},{timeout:15000,retries:0}));setText(button,'Останавливаю…')}catch(error){reportError(error,'Остановка установки')}
 }
 function componentCard(item,byId){
 	const visual=componentVisuals[item.id]||{icon:(item.name||'?').slice(0,2).toUpperCase(),group:'Компонент'}
@@ -170,6 +181,7 @@ function installPanel(){
 		el('div.component-install-head',null,[el('div',null,[el('div.component-eyebrow',{text:'Установка'}),el('h2',{id:'component-install-title',text:installState.label||'Журнал установки'}),el('p.muted',{id:'component-install-message',text:installState.detail||idle})]),badge('Ожидание','off')]),
 		el('div.component-progress-readout',null,[el('span.install-activity',{'aria-hidden':'true'}),el('span',{id:'component-install-phase',text:'Ожидание'}),el('span.install-transfer',{id:'component-install-transfer',text:''}),el('strong.install-percent',{id:'component-install-percent',text:'0%'})]),
 		el('div.progress.component-progress',{id:'component-install-progress',role:'progressbar','aria-valuemin':'0','aria-valuemax':'100','aria-valuenow':String(installState.percent||0)},el('i',{id:'component-install-bar',style:{width:(installState.percent||0)+'%'}})),
+		el('div.install-controls',null,[el('span.muted',{id:'component-install-registry',text:''}),el('button.btn.danger.small.is-hidden',{id:'component-install-cancel',type:'button',onclick:e=>cancelInstall(e.currentTarget)},'Остановить')]),
 		el('pre.log.component-install-log',{id:'component-install-log',text:installState.lines.length?installState.lines.join('\n'):idle}),
 	])
 }
@@ -177,10 +189,11 @@ function syncInstallVisuals(){
 	const running=installState.status==='running',activeId=installState.component,status=statusVisual(),detail=installState.detail||installState.message||(running?'Компонент скачивается и устанавливается…':'Выберите компонент для установки.'),transfer=transferLabel(),percent=progressLabel()
 	const panel=$('#component-install-panel')
 	if(panel){
-		setText($('#component-install-title'),installState.label||'Журнал установки');setText($('#component-install-message'),detail);setText($('#component-install-phase'),phaseLabel(installState.phase));setText($('#component-install-transfer'),transfer);setText($('#component-install-percent'),percent)
+		setText($('#component-install-title'),installState.label||'Журнал установки');setText($('#component-install-message'),detail);setText($('#component-install-phase'),phaseLabel(installState.phase));setText($('#component-install-transfer'),transfer);setText($('#component-install-percent'),percent);setText($('#component-install-registry'),installState.registry?'Источник: '+installState.registry:'')
 		const log=$('#component-install-log');setText(log,installState.lines.length?installState.lines.join('\n'):'Журнал пока пуст.');if(log)log.scrollTop=log.scrollHeight
 		setProgress($('#component-install-progress'));const stateBadge=panel.querySelector('.component-install-head .badge');if(stateBadge){stateBadge.className='badge '+status[1];setText(stateBadge,status[0])}
 		panel.querySelector('.install-activity')?.classList.toggle('active',running)
+		$('#component-install-cancel')?.classList.toggle('is-hidden',!running||!installState.canCancel)
 	}
 	document.querySelectorAll('.component-card').forEach(card=>card.classList.toggle('installing',running&&card.dataset.component===activeId))
 	document.querySelectorAll('[data-inline-progress]').forEach(node=>{
@@ -204,7 +217,7 @@ async function checkInstalledComponent(item,button){
 }
 async function startComponentInstall(item,button){
 	if(installState.status==='running'){toast('Дождитесь завершения текущей установки','warn');return}
-	stopInstallPolling();Object.assign(installState,{jobId:null,component:item.id,label:item.name,status:'running',percent:2,lines:[],message:'',detail:'Подготавливаю загрузку…',phase:'starting',indeterminate:true,downloadedBytes:0,totalBytes:0,speedBps:0,elapsedSec:0,notifiedJob:null,dismissedJob:null})
+	stopInstallPolling();Object.assign(installState,{jobId:null,component:item.id,label:item.name,status:'running',percent:2,lines:[],message:'',detail:'Подготавливаю загрузку…',phase:'starting',indeterminate:true,downloadedBytes:0,totalBytes:0,speedBps:0,elapsedSec:0,registry:'',errorKind:null,recovery:[],canCancel:true,notifiedJob:null,dismissedJob:null})
 	syncInstallVisuals()
 	try{
 		button.classList.add('busy');button.disabled=true
@@ -217,6 +230,12 @@ function onInstallFinished(event){
 	if(!applyInstallUpdate(event))return
 	installState.status=event.status==='ok'?'ok':'error';installState.indeterminate=false;installState.percent=event.status==='ok'?100:(event.percent??installState.percent);installState.message=event.message||event.detail||'Установка завершена';installState.detail=installState.message;stopInstallPolling();syncInstallVisuals()
 	if(installState.notifiedJob!==installState.jobId){installState.notifiedJob=installState.jobId;toast(installState.message,installState.status==='ok'?'ok':'bad')}
+	refresh(true)
+}
+function npmDoctor(summary){
+	const info=summary.npm||{},warn=info.level==='warn'
+	const repair=el('button.btn.'+(warn?'primary':'ghost')+'.small',{type:'button',onclick:async e=>{const ok=await confirmDialog('Переключить npm на registry.npmjs.org и перезапустить включённые npx-сервисы?',{title:'Исправить npm',okLabel:'Исправить',danger:false});if(!ok)return;try{const result=await withBusy(e.currentTarget,()=>rpc('install.npmRepair',{}, {timeout:90000,retries:0}));toast(result.detail||'npm исправлен','ok');refresh(true)}catch(error){reportError(error,'Исправление npm')}}},warn?'Исправить автоматически':'Перепроверить npm')
+	return el('section.npm-doctor.'+(warn?'warn':'ok'),null,[el('div.npm-doctor-mark',{text:warn?'!':'✓'}),el('div.npm-doctor-copy',null,[el('strong',{text:'npm и источник пакетов'}),el('p',{text:info.detail||'Проверка npm недоступна'}),el('code',{text:info.registry||'npm не найден'}),info.environmentOverride?el('small',{text:'Переменная окружения: '+info.environmentOverride}):null]),repair])
 }
 function renderComponents(host){
 	title('Компоненты','Проверка и отдельная установка каждой зависимости')
@@ -225,7 +244,7 @@ function renderComponents(host){
 	const detectButton=el('button.btn.ghost',{type:'button',onclick:async event=>{try{await withBusy(event.currentTarget,()=>refresh(true));toast('Список компонентов обновлён','ok')}catch(error){reportError(error,'Проверка компонентов')}}},'Перепроверить')
 	const overview=el('section.component-overview',null,[el('div.component-overview-copy',null,[el('div.component-eyebrow',{text:'Локальная среда'}),el('h2',{text:'Каждый компонент — отдельно'}),el('p.muted',{text:'Во время установки прогресс виден прямо в карточке и в закреплённом индикаторе.'})]),el('div.component-overview-stats',null,[el('div.component-stat',null,[el('strong',{text:String(installed)}),el('span',{text:'установлено'})]),el('div.component-stat'+(requiredMissing?'.bad':''),null,[el('strong',{text:String(items.length-installed)}),el('span',{text:'не найдено'})])]),detectButton])
 	const grid=items.length?el('div.component-grid',null,items.map(item=>componentCard(item,byId))):empty('Не удалось получить список компонентов')
-	clear(host).append(el('div.components-shell',null,[overview,grid,installPanel()]))
+	clear(host).append(el('div.components-shell',null,[overview,npmDoctor(summary),grid,installPanel()]))
 	app.view={onInstallProgress,onInstallFinished};syncInstallVisuals()
 }
 

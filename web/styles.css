@@ -519,6 +519,36 @@ pre.log {
 .component-install-head h2 { margin: 2px 0 3px; }
 .component-progress { height: 8px; }
 .component-install-log { min-height: 156px; max-height: 260px; background: var(--surface-2); }
+.install-controls { display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:36px; }
+.install-controls .muted { min-width:0; overflow-wrap:anywhere; font:12px/1.4 var(--mono); }
+
+.npm-doctor {
+  display:grid; grid-template-columns:38px minmax(0,1fr) auto; gap:12px; align-items:center;
+  padding:14px 16px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface);
+}
+.npm-doctor.ok { border-color:color-mix(in srgb,var(--ok) 34%,var(--border)); }
+.npm-doctor.warn { border-color:color-mix(in srgb,var(--warn) 44%,var(--border)); background:var(--warn-soft); }
+.npm-doctor-mark { width:34px; height:34px; display:grid; place-items:center; border-radius:10px; background:var(--surface-2); color:var(--ok); font-weight:900; }
+.npm-doctor.warn .npm-doctor-mark { color:var(--warn); }
+.npm-doctor-copy { min-width:0; display:flex; flex-direction:column; gap:3px; }
+.npm-doctor-copy p,.npm-doctor-copy small { color:var(--muted); font-size:12.5px; overflow-wrap:anywhere; }
+.npm-doctor-copy code { color:var(--text); font-size:12px; overflow-wrap:anywhere; }
+
+.diagnosis-body { display:flex; flex-direction:column; gap:14px; }
+.diagnosis-summary { display:flex; flex-direction:column; gap:4px; padding:12px; border:1px solid var(--border); border-radius:var(--radius-sm); }
+.diagnosis-summary.ok { background:var(--ok-soft); border-color:color-mix(in srgb,var(--ok) 38%,var(--border)); }
+.diagnosis-summary.bad { background:var(--bad-soft); border-color:color-mix(in srgb,var(--bad) 38%,var(--border)); }
+.diagnosis-checks { display:flex; flex-direction:column; gap:7px; }
+.diagnosis-check { display:grid; grid-template-columns:28px minmax(0,1fr); gap:9px; align-items:start; padding:9px 10px; border:1px solid var(--border); border-radius:var(--radius-sm); }
+.diagnosis-check p { margin-top:3px; font-size:12.5px; overflow-wrap:anywhere; }
+.diagnosis-mark { width:24px; height:24px; display:grid; place-items:center; border-radius:50%; background:var(--surface-2); font-weight:900; }
+.diagnosis-check.ok .diagnosis-mark { color:var(--ok); }
+.diagnosis-check.warn .diagnosis-mark { color:var(--warn); }
+.diagnosis-check.bad .diagnosis-mark { color:var(--bad); }
+.recovery-box { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:12px; border:1px solid color-mix(in srgb,var(--accent) 38%,var(--border)); border-radius:var(--radius-sm); background:var(--accent-soft); }
+.recovery-box p { margin-top:4px; max-width:54ch; font-size:12.5px; }
+.diagnosis-log summary { cursor:pointer; color:var(--muted); font-size:13px; }
+.diagnosis-log .log { margin-top:8px; max-height:320px; }
 
 /* Живой прогресс: виден в карточке, журнале и закреплённом индикаторе. */
 .component-card.installing {
@@ -607,6 +637,9 @@ pre.log {
   .component-card-actions { grid-template-columns: 1fr; }
   .component-action-install, .component-action-detail, .component-action-source { grid-column: 1; }
   .component-install-head { flex-direction: column; }
+  .npm-doctor { grid-template-columns:34px minmax(0,1fr); }
+  .npm-doctor > .btn { grid-column:1 / -1; width:100%; }
+  .recovery-box { align-items:stretch; flex-direction:column; }
 }
 
 /* ------------------------------- формы -------------------------------- */

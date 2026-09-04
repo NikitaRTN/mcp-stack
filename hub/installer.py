@@ -17,8 +17,11 @@ import io
 import json
 import os
 import platform
+import queue
 import re
+import shlex
 import shutil
+import subprocess
 import tarfile
 import threading
 import time
@@ -32,6 +35,8 @@ from .events import BUS
 
 CADDY_API = "https://api.github.com/repos/caddyserver/caddy/releases/latest"
 USER_AGENT = "MCP-Hub-Installer"
+OFFICIAL_NPM_REGISTRY = "https://registry.npmjs.org/"
+DESKTOP_COMMANDER_VERSION = "0.2.48"
 JOBS = {}
 _jobs_lock = threading.Lock()
 
@@ -155,6 +160,9 @@ def _npm_roots():
         os.path.join(os.environ.get("LOCALAPPDATA", home), "npm-cache", "_npx"),
     ]
     if processes.which("npm"):
+        code, out = processes.run("npm config get cache", timeout=8)
+        if code == 0 and (out or "").strip():
+            roots.append(os.path.join((out or "").strip().splitlines()[0], "_npx"))
         code, out = processes.run("npm root -g", timeout=8)
         if code == 0 and (out or "").strip():
             roots.append((out or "").strip().splitlines()[0])
@@ -210,11 +218,72 @@ def _npm_cached(package):
     return _npm_package_info(package) is not None
 
 
+def _npm_registry():
+    if not processes.which("npm"):
+        return ""
+    code, out = processes.run("npm config get registry", timeout=8)
+    if code != 0:
+        return ""
+    return (out or "").strip().splitlines()[0].rstrip("/") + "/"
+
+
+def _npm_cache_path():
+    if not processes.which("npm"):
+        return ""
+    code, out = processes.run("npm config get cache", timeout=8)
+    return (out or "").strip().splitlines()[0] if code == 0 and (out or "").strip() else ""
+
+
+def npm_status():
+    registry = _npm_registry()
+    env_registry = next((str(value) for key, value in os.environ.items()
+                         if key.lower() == "npm_config_registry" and value), "")
+    official = registry.rstrip("/") == OFFICIAL_NPM_REGISTRY.rstrip("/")
+    env_official = (not env_registry or
+                    env_registry.rstrip("/") == OFFICIAL_NPM_REGISTRY.rstrip("/"))
+    return {
+        "available": bool(processes.which("npm")),
+        "registry": registry,
+        "officialRegistry": OFFICIAL_NPM_REGISTRY,
+        "usesOfficial": official,
+        "environmentOverride": env_registry,
+        "cache": _npm_cache_path(),
+        "level": "ok" if official and env_official else "warn",
+        "detail": ("Официальный npm registry активен" if official and env_official else
+                   "Registry или переменная окружения могут использовать отстающее зеркало"),
+    }
+
+
+def repair_npm():
+    """Switch npm to the official registry and remove an inherited override.
+
+    This is intentionally narrow: package caches and user files are preserved.
+    Newly started npx children inherit the repaired environment immediately.
+    """
+    if not processes.which("npm"):
+        return {"ok": False, "detail": "npm не найден — сначала установите Node.js"}
+    removed = []
+    for key in list(os.environ):
+        if key.lower() == "npm_config_registry":
+            removed.append(key)
+            os.environ.pop(key, None)
+    command = 'npm config set registry "%s" --location=user' % OFFICIAL_NPM_REGISTRY
+    code, out = processes.run(command, timeout=30)
+    if code != 0:
+        return {"ok": False, "detail": "Не удалось изменить npm registry", "output": (out or "")[-1200:]}
+    code, out = processes.run('npm ping --registry="%s"' % OFFICIAL_NPM_REGISTRY, timeout=30)
+    if code != 0:
+        return {"ok": False, "detail": "Официальный npm registry не отвечает",
+                "output": (out or "")[-1200:]}
+    return {"ok": True, "detail": "npm переключён на официальный registry",
+            "registry": OFFICIAL_NPM_REGISTRY, "removedEnvironmentOverrides": removed}
+
+
 def summary():
     items = detect()
     missing = [i for i in items if i["required"] and not i["found"]]
     return {"components": items, "ready": not missing,
-            "missing": [i["id"] for i in missing]}
+            "missing": [i["id"] for i in missing], "npm": npm_status()}
 
 
 # --------------------------------------------------------------------------- #
@@ -239,6 +308,11 @@ class Job:
         self.downloaded_bytes = 0
         self.total_bytes = 0
         self.speed_bps = 0
+        self.registry = ""
+        self.error_kind = None
+        self.recovery = []
+        self.process_pid = None
+        self.cancel_requested = threading.Event()
 
     def _apply(self, percent=None, detail=None, phase=None, indeterminate=None,
                downloadedBytes=None, totalBytes=None, speedBps=None):
@@ -275,6 +349,10 @@ class Job:
             "startedAt": self.started,
             "updatedAt": self.updated,
             "finishedAt": self.finished,
+            "registry": self.registry,
+            "errorKind": self.error_kind,
+            "recovery": self.recovery,
+            "canCancel": self.status == "running",
         }
 
     def log(self, text, percent=None, **progress):
@@ -304,6 +382,11 @@ class Job:
         payload = self._state()
         payload.update({"message": message, "components": detect()})
         BUS.publish("install.finished", payload)
+
+    def fail(self, message, kind="npm", recovery=None):
+        self.error_kind = kind
+        self.recovery = list(recovery or [])
+        self.done(False, message)
 
     def snapshot(self):
         state = self._state()
@@ -342,6 +425,18 @@ def job(job_id):
     with _jobs_lock:
         found = JOBS.get(job_id)
     return found.snapshot() if found else None
+
+
+def cancel_job(job_id):
+    with _jobs_lock:
+        found = JOBS.get(job_id)
+    if found is None:
+        return None
+    if found.status != "running":
+        return found.snapshot()
+    found.cancel_requested.set()
+    found.pulse("Останавливаю установку…", phase="done", indeterminate=True)
+    return found.snapshot()
 
 
 # --------------------------------------------------------------------------- #
@@ -546,6 +641,96 @@ def _run_with_pulse(job, callback, detail, phase="install", interval=0.8):
         thread.join(0.2)
 
 
+def _clean_process_line(line):
+    return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", str(line or "")).strip()
+
+
+def _run_streaming(job, command, timeout=600):
+    """Run npm while streaming real output and keeping cancellation responsive."""
+    config.LOGS.mkdir(parents=True, exist_ok=True)
+    output = []
+    lines = queue.Queue()
+    kwargs = {
+        "cwd": str(config.ROOT), "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL, "text": True, "bufsize": 1,
+        "errors": "replace",
+    }
+    if processes.IS_WINDOWS:
+        kwargs.update({"shell": True,
+                       "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000})
+        args = command
+    else:
+        args = shlex.split(command)
+    proc = subprocess.Popen(args, **kwargs)
+    job.process_pid = proc.pid
+
+    def reader():
+        try:
+            for raw in iter(proc.stdout.readline, ""):
+                lines.put(raw)
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=reader, name="install-output", daemon=True).start()
+    started = time.time()
+    reader_done = False
+    last_detail = "npm разрешает зависимости и выполняет install-скрипты"
+    while True:
+        if job.cancel_requested.is_set():
+            processes.kill_tree(proc.pid)
+            proc.wait(timeout=10)
+            return 130, "\n".join(output)
+        if time.time() - started >= timeout:
+            processes.kill_tree(proc.pid)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            return 124, "\n".join(output + ["Таймаут npm: %d с" % timeout])
+        try:
+            raw = lines.get(timeout=0.5)
+            if raw is None:
+                reader_done = True
+            else:
+                line = _clean_process_line(raw)
+                if line:
+                    output.append(line)
+                    del output[:-300]
+                    last_detail = line[:240]
+                    job.log(line, detail=last_detail, phase="install", indeterminate=True)
+        except queue.Empty:
+            elapsed = int(time.time() - started)
+            job.pulse("%s · %d с" % (last_detail, elapsed), phase="install", indeterminate=True)
+        if proc.poll() is not None and reader_done and lines.empty():
+            break
+    job.process_pid = None
+    return int(proc.returncode or 0), "\n".join(output)
+
+
+def _npm_failure(output, code):
+    text = str(output or "")
+    lower = text.lower()
+    if code == 130:
+        return "cancelled", "Установка отменена", ["Повторите установку, когда будете готовы"]
+    if code == 124:
+        return "timeout", "npm не завершился за 10 минут", [
+            "Проверьте интернет и повторите установку", "Закройте другие процессы npm, если они держат кеш"]
+    if "etarget" in lower or "notarget" in lower or "no match found for version" in lower:
+        return "registry", "Registry не содержит нужную версию зависимости", [
+            "Переключите npm на официальный registry", "Повторите установку"]
+    if "e404" in lower or "404 not found" in lower:
+        return "registry", "Пакет или версия не найдены в npm registry", [
+            "Переключите npm на официальный registry", "Проверьте имя и версию пакета"]
+    if "eacces" in lower or "eperm" in lower:
+        return "permissions", "npm не получил доступ к файлам кеша", [
+            "Закройте другие npm-процессы", "Повторите установку от имени текущего пользователя"]
+    if "enospc" in lower:
+        return "disk", "Недостаточно места на диске", ["Освободите место и повторите установку"]
+    if "ebadengine" in lower or "unsupported engine" in lower:
+        return "node", "Версия Node.js не подходит пакету", ["Обновите Node.js LTS и повторите установку"]
+    return "npm", "npm завершился с кодом %d" % code, ["Откройте журнал npm и повторите установку"]
+
+
 def _install_node(job):
     if processes.which("node"):
         return job.done(True, "Node.js уже установлен")
@@ -590,30 +775,45 @@ def _install_node(job):
     job.done(True, "Node.js %s готов" % version)
 
 
-def _warm_npm_package(job, package, label):
+def _warm_npm_package(job, package, label, version="latest"):
     current = _npm_package_info(package)
     if current:
         version = current.get("version") or "установлен"
         return job.done(True, "%s %s уже готов" % (label, version))
     if not processes.which("npm"):
         return job.done(False, "Сначала установите Node.js")
-    detail = "npm скачивает и распаковывает %s" % label
-    job.log("Скачиваю %s из npm в локальный кеш…" % label, 20,
-            detail=detail, phase="download", indeterminate=True)
-    command = ("npm exec --yes --package=\"%s@latest\" -- "
-               "node -e \"console.log('package-ready')\"") % package
-    code, out = _run_with_pulse(
-        job, lambda: processes.run(command, timeout=600), detail, phase="download")
-    tail = [line.strip() for line in (out or "").splitlines() if line.strip()][-12:]
-    for line in tail:
-        job.log(line, detail="Обрабатываю результат npm…",
-                phase="install", indeterminate=True)
-    if code != 0:
-        return job.done(False, "npm вернул код %d" % code)
+    registry = _npm_registry() or OFFICIAL_NPM_REGISTRY
+    spec = "%s@%s" % (package, version)
+    registries = [registry]
+    if registry.rstrip("/") != OFFICIAL_NPM_REGISTRY.rstrip("/"):
+        registries.append(OFFICIAL_NPM_REGISTRY)
+    code, out = 1, ""
+    for attempt, candidate in enumerate(registries):
+        job.registry = candidate
+        job.log("Источник: %s" % candidate, 12, detail="Проверяю npm registry…",
+                phase="download", indeterminate=True)
+        command = ('npm exec --yes --loglevel=notice --registry="%s" '
+                   '--package="%s" -- node -e "console.log(\'package-ready\')"'
+                   % (candidate, spec))
+        job.log("Устанавливаю %s; npm покажет реальные этапы ниже" % spec, 20,
+                detail="npm разрешает зависимости…", phase="download", indeterminate=True)
+        code, out = _run_streaming(job, command, timeout=600)
+        if code == 0:
+            break
+        kind, message, recovery = _npm_failure(out, code)
+        if kind == "registry" and attempt + 1 < len(registries):
+            job.log("Зеркало не содержит зависимость. Автоматически повторяю через npmjs.org…",
+                    24, detail="Переключаюсь на официальный npm registry",
+                    phase="download", indeterminate=True)
+            continue
+        return job.fail(message, kind, recovery)
     job.log("Проверяю пакет…", 92, detail="Проверяю установленный пакет…",
             phase="verify", indeterminate=False)
     current = _npm_package_info(package)
     version = current.get("version") if current else None
+    if current is None:
+        return job.fail("npm завершился успешно, но пакет не найден в кеше",
+                        "verify", ["Нажмите «Перепроверить»", "Повторите установку"])
     job.done(True, "%s%s готов — первый запуск будет быстрым" %
              (label, " " + version if version else ""))
 
@@ -624,4 +824,5 @@ def _warm_supergateway(job):
 
 def _warm_desktop_commander(job):
     return _warm_npm_package(
-        job, "@wonderwhy-er/desktop-commander", "Desktop Commander")
+        job, "@wonderwhy-er/desktop-commander", "Desktop Commander",
+        DESKTOP_COMMANDER_VERSION)

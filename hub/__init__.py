@@ -5,4 +5,4 @@ binary. Nothing is vendored into the repository, so a release stays a few
 hundred kilobytes.
 """
 
-__version__ = "3.4.0"
+__version__ = "3.4.1"

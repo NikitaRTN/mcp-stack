@@ -183,6 +183,43 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(snapshot["detail"], "Скачивание файла…")
         self.assertIsNone(publish.call_args.args[1]["line"])
 
+    def test_npm_registry_failure_has_actionable_recovery(self):
+        kind, message, recovery = installer._npm_failure(
+            "npm error code ETARGET\nNo matching version found", 1)
+        self.assertEqual(kind, "registry")
+        self.assertIn("Registry", message)
+        self.assertTrue(any("официальный" in item for item in recovery))
+
+    def test_npm_install_retries_official_registry_after_stale_mirror(self):
+        npm_error = "npm error code ETARGET\nNo matching version found"
+        with mock.patch.object(installer, "_npm_package_info",
+                               side_effect=[None, {"path": "/cache/pkg", "version": "0.2.48"}]), \
+                mock.patch.object(installer.processes, "which", return_value="npm"), \
+                mock.patch.object(installer, "_npm_registry",
+                                  return_value="https://registry.npmmirror.com/"), \
+                mock.patch.object(installer, "_run_streaming",
+                                  side_effect=[(1, npm_error), (0, "package-ready")]) as run, \
+                mock.patch.object(installer, "detect", return_value=[]), \
+                mock.patch.object(installer.BUS, "publish"):
+            job = installer.Job("desktop-commander")
+            installer._warm_npm_package(
+                job, "@wonderwhy-er/desktop-commander", "Desktop Commander", "0.2.48")
+
+        self.assertEqual(job.status, "ok")
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("registry.npmjs.org", run.call_args_list[1].args[1])
+
+    def test_npm_status_accepts_official_environment_override(self):
+        with mock.patch.object(installer.processes, "which", return_value="npm"), \
+                mock.patch.object(installer, "_npm_registry",
+                                  return_value=installer.OFFICIAL_NPM_REGISTRY), \
+                mock.patch.object(installer, "_npm_cache_path", return_value="/cache"), \
+                mock.patch.dict(os.environ,
+                                {"NPM_CONFIG_REGISTRY": installer.OFFICIAL_NPM_REGISTRY},
+                                clear=False):
+            status = installer.npm_status()
+        self.assertEqual(status["level"], "ok")
+
 
 class DeveloperWorkspaceTests(unittest.TestCase):
     def sample(self):
@@ -273,6 +310,69 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             result = api.settings_update({"httpsPort": 9443, "adminPort": 9765,
                                           "inspectorPort": 9770})
         self.assertEqual(set(result["restartRequired"]), {"adminPort", "inspectorPort"})
+
+    def test_service_diagnose_checks_every_mcp_hop_without_leaking_tokens(self):
+        cfg = json.loads(json.dumps(config.DEFAULTS))
+        cfg["token"] = "private-hub-token"
+        svc = cfg["services"][0]
+        svc.update({"enabled": True, "authMode": "token"})
+        success = {
+            "serverInfo": {"name": "unit-mcp"}, "count": 2,
+            "elapsedMs": 12.5, "protocolVersion": "2025-03-26", "tools": [],
+        }
+        with mock.patch.object(config, "load", return_value=cfg), \
+                mock.patch.object(config, "service", return_value=svc), \
+                mock.patch.object(config, "upstream_of", return_value="http://127.0.0.1:8000/mcp"), \
+                mock.patch.object(config, "public_url", return_value="https://example.test/mcp"), \
+                mock.patch.object(supervisor, "service_status", return_value={
+                    "state": "up", "detail": "Слушает", "pid": 42, "listening": True}), \
+                mock.patch.object(api.processes, "tail", return_value="child log"), \
+                mock.patch.object(mcp_client, "list_tools", return_value=success) as list_tools:
+            result = api.service_diagnose({"id": "dc", "timeout": 3})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([item["id"] for item in result["checks"]],
+                         ["config", "process", "upstream", "inspector", "public"])
+        self.assertEqual(list_tools.call_count, 3)
+        self.assertNotIn("private-hub-token", json.dumps(result))
+
+    def test_service_diagnose_names_upstream_as_first_failed_hop(self):
+        cfg = json.loads(json.dumps(config.DEFAULTS))
+        svc = cfg["services"][0]
+        svc.update({"enabled": True, "authMode": "token"})
+        success = {"serverInfo": {}, "count": 0, "elapsedMs": 1,
+                   "protocolVersion": "2025-03-26", "tools": []}
+        with mock.patch.object(config, "load", return_value=cfg), \
+                mock.patch.object(config, "service", return_value=svc), \
+                mock.patch.object(config, "upstream_of", return_value="http://127.0.0.1:8000/mcp"), \
+                mock.patch.object(config, "public_url", return_value="https://example.test/mcp"), \
+                mock.patch.object(supervisor, "service_status", return_value={
+                    "state": "up", "detail": "Слушает", "pid": 42, "listening": True}), \
+                mock.patch.object(api.processes, "tail", return_value=""), \
+                mock.patch.object(mcp_client, "list_tools", side_effect=[
+                    mcp_client.McpClientError("Пустой SSE"), success, success]):
+            result = api.service_diagnose({"id": "dc", "timeout": 3})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("upstream", result["summary"])
+        self.assertEqual(result["checks"][2]["status"], "error")
+        self.assertEqual(result["recovery"][0]["method"], "service.restart")
+
+    def test_service_diagnose_offers_npm_repair_for_etarget(self):
+        cfg = json.loads(json.dumps(config.DEFAULTS))
+        svc = cfg["services"][0]
+        svc.update({"enabled": True, "authMode": "token"})
+        with mock.patch.object(config, "load", return_value=cfg), \
+                mock.patch.object(config, "service", return_value=svc), \
+                mock.patch.object(config, "upstream_of", return_value="http://127.0.0.1:8000/mcp"), \
+                mock.patch.object(supervisor, "service_status", return_value={
+                    "state": "up", "detail": "Слушает", "pid": 42, "listening": True}), \
+                mock.patch.object(api.processes, "tail",
+                                  return_value="npm error code ETARGET"), \
+                mock.patch.object(mcp_client, "list_tools",
+                                  side_effect=mcp_client.McpClientError("Пустой SSE")):
+            result = api.service_diagnose({"id": "dc", "timeout": 3})
+        self.assertEqual(result["recovery"][0]["method"], "install.npmRepair")
 
 
 class CertificateTests(unittest.TestCase):

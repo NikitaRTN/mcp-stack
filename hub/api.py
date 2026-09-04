@@ -32,7 +32,7 @@ LOG = logbook.LOG
 QUIET_METHODS = frozenset((
     "state.get", "calls.list", "calls.stats", "calls.detail", "logs.tail",
     "logs.snapshot", "logs.file", "install.job", "install.detect", "service.logs",
-    "firewall.status", "domain.status",
+    "firewall.status", "domain.status", "service.diagnose",
 ))
 
 
@@ -234,6 +234,192 @@ def service_logs(params):
     sid = _need(params, "id")
     path = processes.log_file(supervisor.proc_name(sid))
     return {"path": str(path), "text": processes.tail(path, int((params or {}).get("lines") or 200))}
+
+
+def _chain_auth(svc, cfg, direct=False, access_token=""):
+    """Build auth for a diagnostic hop without returning any secret to the UI."""
+    if direct:
+        mode = svc.get("upstreamAuthMode") or \
+               ("bearer" if svc.get("upstreamToken") else "none")
+        if mode == "bearer":
+            return {"mode": "bearer", "token": svc.get("upstreamToken") or ""}
+        if mode == "oauth":
+            result = dict(svc.get("upstreamOAuth") or {})
+            result["mode"] = "oauth_client_credentials"
+            return result
+        return {"mode": "none"}
+    mode = svc.get("authMode") or "token"
+    if mode == "token":
+        return {"mode": "bearer", "token": cfg.get("token") or ""}
+    if mode == "oauth" and access_token:
+        return {"mode": "bearer", "token": access_token}
+    return {"mode": "none"}
+
+
+def _chain_mcp_stage(stage_id, label, url, auth, timeout=20, verify_tls=True):
+    started = time.time()
+    try:
+        result = mcp_client.list_tools(
+            url, auth=auth, timeout=timeout, verify_tls=verify_tls)
+        server = result.get("serverInfo") or {}
+        name = server.get("name") or "MCP"
+        return {
+            "id": stage_id, "label": label, "status": "ok", "ok": True,
+            "url": url, "elapsedMs": result.get("elapsedMs"),
+            "detail": "%s ответил, tools: %d" % (name, int(result.get("count") or 0)),
+            "protocolVersion": result.get("protocolVersion"),
+            "toolCount": int(result.get("count") or 0),
+        }
+    except mcp_client.McpClientError as exc:
+        return {
+            "id": stage_id, "label": label, "status": "error", "ok": False,
+            "url": url, "elapsedMs": round((time.time() - started) * 1000, 1),
+            "detail": str(exc),
+        }
+    except Exception as exc:  # noqa: BLE001 - diagnostic must report every hop
+        return {
+            "id": stage_id, "label": label, "status": "error", "ok": False,
+            "url": url, "elapsedMs": round((time.time() - started) * 1000, 1),
+            "detail": "%s: %s" % (type(exc).__name__, exc),
+        }
+
+
+def _diagnosis_recovery(sid, failed, log_tail):
+    """Return safe one-click actions for the first failed chain hop."""
+    failed_id = (failed or {}).get("id")
+    text = (str((failed or {}).get("detail") or "") + "\n" + str(log_tail or "")).lower()
+    if any(marker in text for marker in (
+            "etarget", "notarget", "no matching version", "no match found for version",
+            "registry.npmmirror.com", "@supabase/functions-js")):
+        return [{
+            "id": "repair-npm", "label": "Исправить npm и перезапустить",
+            "detail": "Переключит npm на официальный registry и перезапустит включённые npx-сервисы.",
+            "method": "install.npmRepair", "params": {}, "kind": "primary",
+        }]
+    if failed_id in ("process", "upstream"):
+        return [{
+            "id": "restart-service", "label": "Перезапустить MCP",
+            "detail": "Перезапустит supergateway и дочерний stdio MCP.",
+            "method": "service.restart", "params": {"id": sid}, "kind": "primary",
+        }]
+    if failed_id == "inspector":
+        return [{
+            "id": "restart-service", "label": "Перезапустить MCP",
+            "detail": "Обновит соединение upstream перед повторной проверкой Inspector.",
+            "method": "service.restart", "params": {"id": sid}, "kind": "primary",
+        }]
+    if failed_id == "public":
+        return [{
+            "id": "reload-caddy", "label": "Применить конфигурацию Caddy",
+            "detail": "Перезагрузит маршруты без изменения токенов и настроек.",
+            "method": "caddy.reload", "params": {}, "kind": "primary",
+        }]
+    return []
+
+
+def service_diagnose(params):
+    """Check every hop: process -> upstream -> inspector -> public route."""
+    params = params or {}
+    sid = _need(params, "id")
+    cfg = config.load()
+    svc = config.service(sid, cfg)
+    if svc is None:
+        raise RpcError("Сервис не найден", 404)
+    try:
+        timeout = max(3, min(60, int(params.get("timeout") or 20)))
+    except (TypeError, ValueError):
+        raise RpcError("Таймаут должен быть числом")
+
+    checks = []
+    upstream = config.upstream_of(svc)
+    checks.append({
+        "id": "config", "label": "Конфигурация", "status": "ok" if upstream else "error",
+        "ok": bool(upstream),
+        "detail": ("Upstream: %s" % upstream) if upstream else "Upstream не настроен",
+    })
+
+    status = supervisor.service_status(svc)
+    process_ok = status.get("state") == "up"
+    checks.append({
+        "id": "process", "label": "Процесс и порт",
+        "status": "ok" if process_ok else "error", "ok": process_ok,
+        "detail": status.get("detail") or status.get("state") or "Неизвестно",
+        "pid": status.get("pid"), "listening": status.get("listening"),
+    })
+
+    if not svc.get("enabled") or not upstream or not process_ok:
+        reason = "Сервис выключен" if not svc.get("enabled") else "Upstream не готов"
+        checks.append({"id": "upstream", "label": "Прямой MCP upstream",
+                       "status": "skipped", "ok": False, "detail": reason})
+        log_tail = processes.tail(processes.log_file(supervisor.proc_name(sid)), 120)
+        failed = next((item for item in checks if item.get("status") == "error"), None)
+        recovery = ([{"id": "enable-service", "label": "Включить MCP",
+                      "detail": "Включит сервис и запустит локальный процесс.",
+                      "method": "service.setEnabled", "params": {"id": sid, "enabled": True},
+                      "kind": "primary"}]
+                    if not svc.get("enabled") else _diagnosis_recovery(sid, failed, log_tail))
+        return {
+            "checkedAt": time.time(), "service": sid, "label": svc.get("label") or sid,
+            "ok": False, "summary": "Цепочка остановилась до MCP handshake", "checks": checks,
+            "logTail": log_tail, "recovery": recovery,
+        }
+
+    direct = _chain_mcp_stage(
+        "upstream", "Прямой MCP upstream", upstream,
+        _chain_auth(svc, cfg, direct=True), timeout=timeout,
+        verify_tls=bool((svc.get("upstreamOAuth") or {}).get("verifyTls", True)),
+    )
+    checks.append(direct)
+
+    inspector_url = "http://127.0.0.1:%d/_inspect/%s" % (
+        int(cfg.get("inspectorPort") or 8770), sid)
+    route_mode = svc.get("authMode") or "token"
+    access_token = str(params.get("accessToken") or "").strip()
+    if route_mode == "oauth" and not access_token:
+        checks.append({
+            "id": "inspector", "label": "Inspector",
+            "status": "skipped", "ok": False, "url": inspector_url,
+            "detail": "OAuth-маршруту нужен access token для полной проверки",
+        })
+    else:
+        inspector_auth = ({"mode": "bearer", "token": access_token}
+                          if route_mode == "oauth" else {"mode": "none"})
+        checks.append(_chain_mcp_stage(
+            "inspector", "Inspector", inspector_url, inspector_auth,
+            timeout=timeout, verify_tls=True))
+
+    public_url = config.public_url(svc, cfg)
+    if route_mode == "oauth" and not access_token:
+        checks.append({
+            "id": "public", "label": "Публичный маршрут",
+            "status": "skipped", "ok": False, "url": public_url,
+            "detail": "OAuth discovery доступен, но handshake требует access token",
+        })
+    else:
+        checks.append(_chain_mcp_stage(
+            "public", "Публичный маршрут", public_url,
+            _chain_auth(svc, cfg, direct=False, access_token=access_token),
+            timeout=timeout, verify_tls=True))
+
+    failed = next((item for item in checks if item.get("status") == "error"), None)
+    completed = [item for item in checks if item.get("status") != "skipped"]
+    ok = bool(completed) and all(item.get("ok") for item in completed)
+    if failed and failed.get("id") == "upstream":
+        summary = "Сбой в MCP upstream — проверяйте supergateway и дочерний stdio MCP"
+    elif failed and failed.get("id") == "inspector":
+        summary = "Upstream исправен, сбой возникает в Inspector"
+    elif failed and failed.get("id") == "public":
+        summary = "Локальная цепочка исправна, сбой в Caddy, TLS, DNS или авторизации"
+    elif ok:
+        summary = "Все доступные звенья цепочки работают"
+    else:
+        summary = "Проверка завершена не полностью"
+    log_tail = processes.tail(processes.log_file(supervisor.proc_name(sid)), 120)
+    return {
+        "checkedAt": time.time(), "service": sid, "label": svc.get("label") or sid,
+        "ok": ok, "summary": summary, "checks": checks,
+        "logTail": log_tail, "recovery": _diagnosis_recovery(sid, failed, log_tail),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -646,6 +832,33 @@ def install_job(params):
     return {"job": snapshot}
 
 
+def install_cancel(params):
+    snapshot = installer.cancel_job(_need(params, "jobId"))
+    if snapshot is None:
+        raise RpcError("Задача не найдена", 404)
+    return {"job": snapshot}
+
+
+def install_npm_repair(_params=None):
+    result = installer.repair_npm()
+    if not result.get("ok"):
+        raise RpcError(result.get("detail") or "Не удалось исправить npm")
+    restarted = []
+    failed = []
+    for svc in config.enabled_services():
+        command = str(svc.get("command") or "").lower()
+        if svc.get("kind") != "stdio" or "npx" not in command:
+            continue
+        try:
+            supervisor.restart_service(svc["id"])
+            restarted.append(svc["id"])
+        except (KeyError, ValueError) as exc:
+            failed.append({"service": svc.get("id"), "detail": str(exc)})
+    result.update({"restarted": restarted, "restartFailures": failed})
+    BUS.publish("state.dirty", {})
+    return result
+
+
 # --------------------------------------------------------------------------- #
 #  settings                                                                   #
 # --------------------------------------------------------------------------- #
@@ -799,6 +1012,7 @@ METHODS = {
     "service.create": service_create,
     "service.delete": service_delete,
     "service.logs": service_logs,
+    "service.diagnose": service_diagnose,
     "mcp.tools.list": mcp_tools_list,
     "mcp.tool.call": mcp_tool_call,
     "caddy.start": caddy_start,
@@ -816,6 +1030,8 @@ METHODS = {
     "install.detect": install_detect,
     "install.component": install_component,
     "install.job": install_job,
+    "install.cancel": install_cancel,
+    "install.npmRepair": install_npm_repair,
     "settings.update": settings_update,
     "firewall.status": firewall_status,
     "firewall.authorize": firewall_authorize,

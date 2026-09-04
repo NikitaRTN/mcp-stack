@@ -356,7 +356,12 @@ class InspectorHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             self._close_all(pending, "cancelled", "Клиент закрыл соединение", session=session)
             return
-        self._close_all(pending, "ok", None, session=session)
+        if pending:
+            detail = ("Апстрим закрыл пустой SSE без JSON-RPC ответа"
+                      if total == 0 else
+                      "Апстрим закрыл SSE до ответа на JSON-RPC запрос")
+            self._close_all(pending, "error", detail, session=session,
+                            resp_bytes=total)
 
     def _consume(self, payload, pending, session, size):
         if not payload:
@@ -377,10 +382,11 @@ class InspectorHandler(BaseHTTPRequestHandler):
         status, error = classify(message)
         telemetry.finish(entry.row_id, status, error=error, resp_bytes=size, session=session)
 
-    def _close_all(self, pending, status, error, session=None):
+    def _close_all(self, pending, status, error, session=None, resp_bytes=0):
         while pending:
             _key, entry = pending.popitem()
-            telemetry.finish(entry.row_id, status, error=error, session=session)
+            telemetry.finish(entry.row_id, status, error=error,
+                             resp_bytes=resp_bytes, session=session)
 
     def _upstream_problem(self, svc, detail):
         BUS.publish("service.unreachable", {
