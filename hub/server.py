@@ -7,6 +7,7 @@ why the session cookie is the single gate in front of every mutating call.
 
 import json
 import mimetypes
+import queue
 import secrets
 import threading
 import time
@@ -443,33 +444,40 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     def stream_events(self):
         query = parse_qs(urlsplit(self.path).query)
-        last_seq = int(self.headers.get("Last-Event-ID")
-                       or (query.get("lastSeq", [0])[0]) or 0)
-        sub, backlog = BUS.subscribe(last_seq)
-        LOG.debug("sse", "Подключён поток событий", event="sse.open",
-                  lastSeq=last_seq, backlog=len(backlog), listeners=BUS.listeners + 1)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache, no-transform")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
         try:
+            last_seq = int(self.headers.get("Last-Event-ID")
+                           or (query.get("lastSeq", [0])[0]) or 0)
+            if last_seq < 0:
+                raise ValueError
+        except ValueError:
+            return self.send_json(400, {"error": "Некорректный номер события"})
+        sub, backlog = BUS.subscribe(last_seq)
+        try:
+            LOG.debug("sse", "Подключён поток событий", event="sse.open",
+                      lastSeq=last_seq, backlog=len(backlog), listeners=BUS.listeners)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
             self.wfile.write(b": connected\n\n")
             self.wfile.flush()
             for event in backlog:
                 self.wfile.write(encode(event))
             self.wfile.flush()
-            while True:
+            while BUS.is_subscribed(sub):
                 try:
                     event = sub.get(timeout=HEARTBEAT)
-                    self.wfile.write(encode(event))
-                except Exception:                       # queue.Empty -> heartbeat
+                except queue.Empty:
                     self.wfile.write(b": ping\n\n")
+                else:
+                    self.wfile.write(encode(event))
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
+            self.close_connection = True
             BUS.unsubscribe(sub)
             LOG.debug("sse", "Поток событий закрыт", event="sse.close",
                       listeners=BUS.listeners)

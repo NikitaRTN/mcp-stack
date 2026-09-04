@@ -25,9 +25,10 @@ def render(cfg=None):
     bind = (cfg.get("bind") or "").strip()
     token = cfg.get("token") or ""
     local_only = domain in ("localhost", "127.0.0.1", "")
+    plain_http = local_only or bool(cfg.get("behindProxy"))
 
     out = [HEADER, "{"]
-    if local_only:
+    if plain_http:
         # Plain HTTP on a custom port: it must be declared as the HTTP port, not
         # as https_port, and `auto_https` may appear only once - two auto_https
         # lines in one block make Caddy refuse to start with
@@ -46,19 +47,21 @@ def render(cfg=None):
     out.append("")
 
     site = ("http://localhost:%d" % https_port) if local_only else domain
+    if plain_http and (not local_only or bind in ("0.0.0.0", "::", "[::]")):
+        site = "http://:%d" % https_port
     if bind:
         out.append("%s {" % site)
         out.append("\tbind %s" % bind)
     else:
         out.append("%s {" % site)
 
-    if not local_only and https_port == 443:
+    if not plain_http and https_port == 443:
         # Standard port: Caddy picks the challenge itself. HTTP-01 on :80 and
         # TLS-ALPN on :443 both work, so the certificate is issued and renewed
         # automatically with no extra configuration.
         out.append("\t# TLS: automatic Let's Encrypt certificate (HTTP-01 / TLS-ALPN).")
         out.append("")
-    elif not local_only:
+    elif not plain_http:
         # Non-standard port: TLS-ALPN validation can only arrive on 443, so the
         # router must forward 443 -> https_port. Without that forward no
         # certificate is ever issued - the panel now says so explicitly.
@@ -108,28 +111,38 @@ def render(cfg=None):
         out.append("")
 
     enabled = config.enabled_services(cfg)
+    if any(svc.get("id") == "stabilitymatrix" for svc in enabled):
+        for asset_path in ("/stabilitymatrix-output/*", "/stabilitymatrix-download/*"):
+            out.append("\thandle %s {" % asset_path)
+            out.append("\t\treverse_proxy 127.0.0.1:%d" % int(cfg.get("stabilityMatrixPort") or 8780))
+            out.append("\t}")
+        out.append("")
     for svc in enabled:
         upstream = config.upstream_of(svc)
         if not upstream:
             continue
         path = svc.get("path") or ("/" + svc["id"])
-        auth_mode = svc.get("authMode") or "token"
-        out.append("\t# %s -> inspector -> %s (auth: %s)" %
-                   (svc.get("label") or svc["id"], upstream, auth_mode))
-        out.append("\thandle %s* {" % path)
-        if auth_mode == "token" and token:
-            out.append("\t\trespond @unauthorized \"unauthorized\" 401")
-        elif auth_mode == "oauth":
-            out.append("\t\t# OAuth access token is validated by the inspector.")
-        out.append("\t\trewrite * /_inspect/%s" % svc["id"])
-        out.append("\t\treverse_proxy 127.0.0.1:%d {" % inspector_port)
-        out.append("\t\t\tflush_interval -1")   # never buffer: SSE must stream
-        out.append("\t\t\ttransport http {")
-        out.append("\t\t\t\tversions 1.1")
-        out.append("\t\t\t}")
-        out.append("\t\t}")
-        out.append("\t}")
-        out.append("")
+        paths = [path]
+        if svc.get("id") == "stabilitymatrix":
+            paths += [alias for alias in ("/comfyui", "/stabilitymatrix") if alias != path]
+        for path in paths:
+            auth_mode = svc.get("authMode") or "token"
+            out.append("\t# %s -> inspector -> %s (auth: %s)" %
+                       (svc.get("label") or svc["id"], upstream, auth_mode))
+            out.append("\thandle %s* {" % path)
+            if auth_mode == "token" and token:
+                out.append("\t\trespond @unauthorized \"unauthorized\" 401")
+            elif auth_mode == "oauth":
+                out.append("\t\t# OAuth access token is validated by the inspector.")
+            out.append("\t\trewrite * /_inspect/%s" % svc["id"])
+            out.append("\t\treverse_proxy 127.0.0.1:%d {" % inspector_port)
+            out.append("\t\t\tflush_interval -1")   # never buffer: SSE must stream
+            out.append("\t\t\ttransport http {")
+            out.append("\t\t\t\tversions 1.1")
+            out.append("\t\t\t}")
+            out.append("\t\t}")
+            out.append("\t}")
+            out.append("")
 
     out.append("\t# Nothing else is exposed.")
     out.append("\thandle {")

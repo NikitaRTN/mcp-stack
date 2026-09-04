@@ -65,6 +65,11 @@ class Bus:
         with self._lock:
             self._subscribers.discard(sub)
 
+    def is_subscribed(self, sub):
+        """Позволяет SSE-обработчику закрыть поток после переполнения очереди."""
+        with self._lock:
+            return sub in self._subscribers
+
     @property
     def listeners(self):
         with self._lock:

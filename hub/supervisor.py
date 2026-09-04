@@ -20,6 +20,7 @@ from . import config
 from . import installer
 from . import processes
 from . import telemetry
+from . import stabilitymatrix_mcp
 from .events import BUS
 
 CADDY_NAME = "caddy"
@@ -114,6 +115,9 @@ def start_service(sid):
         raise KeyError(sid)
     if not svc.get("enabled"):
         raise ValueError("Сервис выключен. Сначала включите его тумблером.")
+    if sid == "stabilitymatrix" and svc.get("builtin"):
+        stabilitymatrix_mcp.start_adapter()
+        return os.getpid()
     if svc.get("kind") != "stdio":
         raise ValueError("Внешним MCP управляете вы сами — хаб только проксирует его.")
     command = config.expand_command(svc)
@@ -135,6 +139,8 @@ def stop_service(sid):
     svc = config.service(sid)
     if svc is None:
         raise KeyError(sid)
+    if sid == "stabilitymatrix" and svc.get("builtin"):
+        return stabilitymatrix_mcp.stop_adapter()
     stopped = processes.stop(proc_name(sid))
     BUS.publish("service.changed", {"service": sid, "action": "stop"})
     return stopped
@@ -156,7 +162,7 @@ def set_enabled(sid, enabled):
         caddyfile.write()
         notes = []
         if enabled:
-            if svc.get("kind") == "stdio":
+            if svc.get("kind") == "stdio" or sid == "stabilitymatrix":
                 try:
                     start_service(sid)
                     notes.append("процесс запущен")
@@ -165,7 +171,7 @@ def set_enabled(sid, enabled):
             else:
                 notes.append("внешний MCP должен быть запущен вами")
         else:
-            if svc.get("kind") == "stdio":
+            if svc.get("kind") == "stdio" or sid == "stabilitymatrix":
                 stop_service(sid)
                 notes.append("процесс остановлен")
             notes.append("маршрут %s больше не публикуется" % (svc.get("path") or ""))
@@ -363,7 +369,7 @@ def validate_caddyfile():
 def start_all():
     started, notes = [], []
     for svc in config.enabled_services():
-        if svc.get("kind") != "stdio":
+        if svc.get("kind") != "stdio" and svc.get("id") != "stabilitymatrix":
             continue
         try:
             start_service(svc["id"])
@@ -381,6 +387,7 @@ def start_all():
 
 
 def stop_all():
+    stabilitymatrix_mcp.stop_adapter()
     for svc in config.services():
         processes.stop(proc_name(svc["id"]), quiet=True)
     stop_caddy()
