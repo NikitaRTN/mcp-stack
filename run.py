@@ -112,6 +112,7 @@ def main():
         BUS.publish("hub.stopping", {})
         logbook.LOG.info("hub", "MCP Hub останавливается", event="hub.stopping")
         watchdog.stop()
+        supervisor.stabilitymatrix_mcp.stop_adapter()
         panel.shutdown()
 
     for sig in (signal.SIGINT, signal.SIGTERM):

@@ -9,16 +9,42 @@
   "telemetryDays": 14,
   "autoRestart": true,
   "openBrowser": true,
-  "firewall": { "rules": [] },
+  "firewall": {
+    "rules": []
+  },
   "services": [
-    { "id": "dc", "enabled": false },
-    { "id": "windows", "enabled": false },
-    { "id": "roblox", "enabled": false },
+    {
+      "id": "dc",
+      "enabled": false
+    },
+    {
+      "id": "windows",
+      "enabled": false
+    },
+    {
+      "id": "roblox",
+      "enabled": false
+    },
     {
       "id": "real",
       "enabled": false,
       "authMode": "token",
       "upstreamAuthMode": "none"
+    },
+    {
+      "id": "stabilitymatrix",
+      "enabled": false,
+      "authMode": "oauth",
+      "oauth": {
+        "mode": "builtin"
+      }
     }
-  ]
+  ],
+  "stabilityMatrixPort": 8780,
+  "stabilityMatrixWebUrl": "http://localhost:8188",
+  "comfyuiApiUrl": "http://127.0.0.1:8188",
+  "comfyuiPath": "",
+  "comfyuiListen": "127.0.0.1",
+  "comfyuiAutoStart": true,
+  "behindProxy": false
 }

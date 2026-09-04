@@ -96,6 +96,19 @@ DEFAULT_SERVICES = [
         "requires": [],
         "builtin": True,
     },
+    {
+        "id": "stabilitymatrix",
+        "label": "ComfyUI",
+        "path": "/comfyui",
+        "note": "Config, Prompt, Generate и загрузка моделей через ComfyUI",
+        "kind": "remote",
+        "authMode": "oauth",
+        "oauth": {"mode": "builtin"},
+        "enabled": False,
+        "upstream": "http://127.0.0.1:8780/mcp",
+        "requires": [],
+        "builtin": True,
+    },
 ]
 
 DEFAULTS = {
@@ -105,6 +118,13 @@ DEFAULTS = {
     "httpsPort": 8443,
     "adminPort": 8765,
     "inspectorPort": 8770,
+    "stabilityMatrixPort": 8780,
+    "stabilityMatrixWebUrl": "http://localhost:8188",
+    "comfyuiApiUrl": "http://127.0.0.1:8188",
+    "comfyuiPath": "",
+    "comfyuiListen": "127.0.0.1",
+    "comfyuiAutoStart": True,
+    "behindProxy": False,
     "bind": "",
     "token": "",
     "oauthSigningKey": "",
@@ -152,6 +172,8 @@ def load(force=False):
         for key, value in (raw or {}).items():
             cfg[key] = value
         cfg["services"] = _merge_services(raw.get("services"))
+        comfyui = next(s for s in cfg["services"] if s["id"] == "stabilitymatrix")
+        comfyui["upstream"] = "http://127.0.0.1:%d/mcp" % int(cfg.get("stabilityMatrixPort") or 8780)
         generated = False
         if not cfg.get("token"):
             cfg["token"] = secrets.token_urlsafe(32)
@@ -173,6 +195,8 @@ def _merge_services(stored):
     for template in DEFAULT_SERVICES:
         item = copy.deepcopy(template)
         item.update(by_id.pop(template["id"], {}))
+        if template["id"] == "stabilitymatrix":
+            item["kind"] = "remote"  # миграция локального встроенного адаптера
         item["builtin"] = True
         _service_defaults(item)
         merged.append(item)
@@ -369,6 +393,8 @@ def _validate_service(cfg, item):
         item["upstreamOAuth"] = {}
     else:
         item["upstream"] = str(item.get("upstream") or "").strip()
+        if sid == "stabilitymatrix" and item.get("builtin"):
+            item["upstream"] = "http://127.0.0.1:%d/mcp" % int(cfg.get("stabilityMatrixPort") or 8780)
         _validate_http_url(item["upstream"], "URL внешнего MCP", required=True)
         item["upstreamAuthMode"] = str(item.get("upstreamAuthMode") or
                                        ("bearer" if item.get("upstreamToken") else "none"))
@@ -399,6 +425,10 @@ def delete_service(sid):
 
 
 def _assert_unique_path(cfg, item):
+    if item["id"] != "stabilitymatrix" and any(
+            item["path"].startswith(prefix) for prefix in
+            ("/comfyui", "/stabilitymatrix")):
+        raise ValueError("Путь зарезервирован адаптером ComfyUI")
     for other in cfg["services"]:
         if other.get("id") != item["id"] and other.get("path") == item["path"]:
             raise ValueError("Путь %s уже занят сервисом %s" % (item["path"], other.get("id")))
