@@ -126,13 +126,19 @@ export class EventStream {
 		const handle = (kind) => (message) => {
 			const seq = Number(message.lastEventId || 0)
 			if (seq) this.lastSeq = Math.max(this.lastSeq, seq)
-			let payload = {}
+			let envelope = {}
 			try {
-				payload = message.data ? JSON.parse(message.data) : {}
+				envelope = message.data ? JSON.parse(message.data) : {}
 			} catch {
 				diag.warn("Неразборчивое событие " + kind, { event: "sse.badPayload", kind })
 				return
 			}
+			// Сервер отправляет служебный конверт {seq, ts, kind, data}.
+			// Подписчикам нужен именно payload из data, иначе status/message
+			// установки остаются undefined и успешный результат выглядит ошибкой.
+			const payload = envelope && typeof envelope === "object" && "data" in envelope
+				? (envelope.data ?? {})
+				: envelope
 			this.emit(kind, payload)
 		}
 
