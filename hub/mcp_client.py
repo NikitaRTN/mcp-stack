@@ -120,13 +120,13 @@ class StreamableClient:
         data_lines = []
         total = 0
         while True:
-            line = response.readline(65537)
+            line = response.readline(MAX_RESPONSE + 1)
             if not line:
                 break
             total += len(line)
             if total > MAX_RESPONSE:
                 raise McpClientError("MCP SSE-ответ больше 4 МБ")
-            if len(line) > 65536:
+            if len(line) > MAX_RESPONSE:
                 raise McpClientError("Слишком длинная строка в MCP SSE")
             stripped = line.rstrip(b"\r\n")
             if stripped.startswith(b"data:"):

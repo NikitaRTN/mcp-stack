@@ -110,6 +110,12 @@ def service_status(svc):
 
 
 def start_service(sid):
+    # Serialize manual start, toggle and watchdog: starting is not restarting.
+    with _lock:
+        return _start_service_locked(sid)
+
+
+def _start_service_locked(sid):
     svc = config.service(sid)
     if svc is None:
         raise KeyError(sid)
@@ -123,6 +129,11 @@ def start_service(sid):
     command = config.expand_command(svc)
     if not command.strip():
         raise ValueError("У сервиса не задана команда запуска")
+    current = processes.status(proc_name(sid))
+    if current["running"]:
+        if current.get("command") != command:
+            raise ValueError("Service command changed; use Restart to apply it safely")
+        return current["pid"]
     requires = svc.get("requires") or []
     if "node" in requires and not processes.which("node"):
         raise ValueError("Нужен Node.js — установите его на вкладке «Компоненты»")
@@ -136,6 +147,11 @@ def start_service(sid):
 
 
 def stop_service(sid):
+    with _lock:
+        return _stop_service_locked(sid)
+
+
+def _stop_service_locked(sid):
     svc = config.service(sid)
     if svc is None:
         raise KeyError(sid)
@@ -147,9 +163,10 @@ def stop_service(sid):
 
 
 def restart_service(sid):
-    stop_service(sid)
-    time.sleep(0.4)
-    return start_service(sid)
+    with _lock:
+        stop_service(sid)
+        time.sleep(0.4)
+        return start_service(sid)
 
 
 def set_enabled(sid, enabled):
@@ -158,6 +175,10 @@ def set_enabled(sid, enabled):
         svc = config.service(sid)
         if svc is None:
             raise KeyError(sid)
+        if bool(svc.get("enabled")) == bool(enabled):
+            if enabled and (svc.get("kind") == "stdio" or sid == "stabilitymatrix"):
+                start_service(sid)
+            return {"service": svc, "notes": ["State unchanged; live sessions preserved"]}
         svc = config.set_service(sid, {"enabled": bool(enabled)})
         caddyfile.write()
         notes = []
@@ -274,8 +295,7 @@ def reload_caddy(quiet=False):
     code, out = processes.run('"%s" reload --config "%s"' % (binary, caddyfile.path()),
                              timeout=30)
     if code != 0:
-        restart_caddy()
-        return {"ok": True, "detail": "Reload не удался, выполнен перезапуск", "out": out}
+        return {"ok": False, "detail": "Reload failed; existing Caddy and sessions were left running", "out": out}
     return {"ok": True, "detail": "Конфигурация перезагружена без разрыва соединений"}
 
 

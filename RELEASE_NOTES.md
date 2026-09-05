@@ -1,3 +1,15 @@
+# MCP reliability and Windows UI Automation 1.2.0 (2026-09-06)
+
+- Keep existing service processes and sessions on repeated Start/Enable; require explicit restart after command changes.
+- Leave the current Caddy process running when a configuration reload fails, and preserve active streams during successful reloads.
+- Accept larger SSE lines within the existing 4 MB response limit.
+- Fix numeric JSON-RPC error codes in Windows automation discovery.
+- Add exact window-title and automation-ID selectors, structured window/control lists, and explicit value/selection/toggle inspection (password values redacted).
+- Default screenshots to compact JPEG, with optional PNG, width limits, local saving, and metadata-only responses.
+- Add protocol/reliability regression tests, an opt-in live Windows fixture test, and a scoped UI workflow guide.
+- Existing Windows MCP sessions retain their loaded implementation; reconnect that integration to discover the tenth tool. No Hub/proxy restart is required.
+- Known limit: third-party UI Automation providers may still block during broad scans; prefer exact window and control filters.
+
 # MCP Hub 3.4.1 — самовосстановление npm и MCP
 
 - Установщик показывает реальные строки npm, активный registry и текущий этап вместо

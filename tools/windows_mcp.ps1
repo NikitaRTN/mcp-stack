@@ -23,7 +23,7 @@ function Send-Json($value) {
 function Send-Result($id, $result) {
     Send-Json ([ordered]@{ jsonrpc='2.0'; id=$id; result=$result })
 }
-function Send-Error($id, $message, $code=-32000) {
+function Send-Error($id, $message, [int]$code=-32000) {
     Send-Json ([ordered]@{ jsonrpc='2.0'; id=$id; error=[ordered]@{ code=$code; message=[string]$message } })
 }
 function Text-Result($value) {
@@ -40,21 +40,24 @@ function Tool($name, $description, $schema) {
 function Get-Tools {
     $selector = [ordered]@{
         processId=@{type='integer'; description='Target process ID'}
+        windowName=@{type='string'; description='Exact top-level window title; use to avoid scanning unrelated windows'}
         name=@{type='string'; description='Exact accessible name'}
         controlType=@{type='string'; description='Window, Button, Edit, DataItem, RadioButton, CheckBox, etc.'}
+        automationId=@{type='string'; description='Exact stable UI Automation ID'}
         className=@{type='string'; description='Optional native/UIA class name'}
         occurrence=@{type='integer'; minimum=0; default=0}
     }
     return @(
         (Tool 'list_windows' 'List visible top-level Windows UI Automation windows.' (Schema ([ordered]@{ title=@{type='string'}; processId=@{type='integer'} })))
-        (Tool 'list_controls' 'List accessible controls for one process, with names, types, bounds and supported patterns.' (Schema ([ordered]@{ processId=@{type='integer'}; name=@{type='string'}; controlType=@{type='string'}; className=@{type='string'}; limit=@{type='integer'; minimum=1; maximum=1000; default=250} }) @('processId')))
+        (Tool 'list_controls' 'List accessible controls for one process, with names, types, bounds and supported patterns.' (Schema ([ordered]@{ processId=@{type='integer'}; windowName=@{type='string'}; name=@{type='string'}; automationId=@{type='string'}; controlType=@{type='string'}; className=@{type='string'}; limit=@{type='integer'; minimum=1; maximum=1000; default=250} }) @('processId')))
+        (Tool 'get_control_details' 'Read control value and selection/toggle state; password fields are redacted.' (Schema $selector @('processId')))
         (Tool 'invoke_control' 'Invoke a button, menu item or other accessible control without screen coordinates.' (Schema $selector @('processId')))
         (Tool 'set_control_value' 'Set the ValuePattern text of an accessible edit control.' (Schema ([ordered]@{} + $selector + [ordered]@{ value=@{type='string'} }) @('processId','value')))
         (Tool 'select_control' 'Select a list/radio item or set a checkbox toggle state.' (Schema ([ordered]@{} + $selector + [ordered]@{ state=@{type='boolean'; default=$true} }) @('processId')))
         (Tool 'click_control' 'Click the center of an accessible control after resolving it semantically.' (Schema $selector @('processId')))
         (Tool 'send_keys' 'Activate a process/window and send Windows SendKeys text.' (Schema ([ordered]@{ processId=@{type='integer'}; title=@{type='string'}; keys=@{type='string'} }) @('keys')))
         (Tool 'wait_for_control' 'Wait until a matching accessible control appears and optionally becomes enabled.' (Schema ([ordered]@{} + $selector + [ordered]@{ timeoutSeconds=@{type='number'; minimum=0.1; maximum=120; default=15}; enabled=@{type='boolean'} }) @('processId')))
-        (Tool 'capture_screenshot' 'Capture the virtual desktop or a process window as PNG.' (Schema ([ordered]@{ processId=@{type='integer'}; title=@{type='string'}; desktop=@{type='boolean'; default=$false} })))
+        (Tool 'capture_screenshot' 'Capture a compact preview or save locally without base64 output. Defaults to JPEG at max 1280px width.' (Schema ([ordered]@{ processId=@{type='integer'}; title=@{type='string'}; desktop=@{type='boolean'; default=$false}; maxWidth=@{type='integer'; minimum=320; maximum=3840; default=1280}; format=@{type='string'; enum=@('jpeg','png'); default='jpeg'}; saveTo=@{type='string'; description='Optional absolute local file path'}; includeImage=@{type='boolean'; default=$true} })))
     )
 }function Type-Name($element) {
     return ($element.Current.ControlType.ProgrammaticName -replace '^ControlType\.','')
@@ -75,15 +78,27 @@ function Matches($element, $inputArgs) {
     if ($inputArgs.name -and $element.Current.Name -ne [string]$inputArgs.name) { return $false }
     if ($inputArgs.controlType -and (Type-Name $element) -ne [string]$inputArgs.controlType) { return $false }
     if ($inputArgs.className -and $element.Current.ClassName -ne [string]$inputArgs.className) { return $false }
+    if ($inputArgs.automationId -and $element.Current.AutomationId -ne [string]$inputArgs.automationId) { return $false }
     return $true
 }
-function Process-Elements($processId) {
+function Process-Elements($processId, $windowName) {
+    if ([int]$processId -le 0) { throw 'A positive processId is required' }
     $condition = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ProcessIdProperty, [int]$processId)
-    return [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants, $condition)
-}function Find-Control($inputArgs) {
-    $items = Process-Elements ([int]$inputArgs.processId)
+    # Only traverse target windows, never every desktop control.
+    $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+        [System.Windows.Automation.TreeScope]::Children, $condition)
+    $result = New-Object 'System.Collections.Generic.List[System.Windows.Automation.AutomationElement]'
+    foreach ($window in $windows) {
+        if ($windowName -and $window.Current.Name -ne [string]$windowName) { continue }
+        $result.Add($window)
+        $children = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        foreach ($child in $children) { $result.Add($child) }
+    }
+    return ,$result
+}
+function Find-Control($inputArgs) {
+    $items = Process-Elements ([int]$inputArgs.processId) $inputArgs.windowName
     $matches = @()
     for ($i=0; $i -lt $items.Count; $i++) {
         $element = $items.Item($i)
@@ -111,7 +126,7 @@ function List-Windows($inputArgs) {
 }
 function List-Controls($inputArgs) {
     $limit = if ($inputArgs.limit) { [math]::Min(1000,[math]::Max(1,[int]$inputArgs.limit)) } else { 250 }
-    $items = Process-Elements ([int]$inputArgs.processId); $result = @()
+    $items = Process-Elements ([int]$inputArgs.processId) $inputArgs.windowName; $result = @()
     for ($i=0; $i -lt $items.Count -and $result.Count -lt $limit; $i++) {
         $element = $items.Item($i)
         if (Matches $element $inputArgs) { $result += Element-Data $element }
@@ -131,6 +146,7 @@ function Set-ControlValue($inputArgs) {
 }
 function Select-Control($inputArgs) {
     $element = Find-Control $inputArgs
+    $pattern = $null
     if ($element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern,[ref]$pattern)) {
         ([System.Windows.Automation.SelectionItemPattern]$pattern).Select()
     } elseif ($element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern,[ref]$pattern)) {
@@ -174,28 +190,77 @@ function Screenshot($inputArgs) {
         $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
         $rect = New-Object System.Drawing.Rectangle($screen.Left,$screen.Top,$screen.Width,$screen.Height)
     } else {
-        $windows = List-Windows $inputArgs
+        if (-not $inputArgs.processId -and -not $inputArgs.title) { throw 'Specify processId, title, or desktop=true' }
+        $windows = @(List-Windows $inputArgs)
         if (-not $windows.Count) { throw 'Target window not found' }
         $w = $windows[0].bounds
         $rect = New-Object System.Drawing.Rectangle($w.left,$w.top,$w.width,$w.height)
     }
     if ($rect.Width -le 0 -or $rect.Height -le 0) { throw 'Screenshot bounds are empty' }
+    $maxWidth = if ($inputArgs.maxWidth) { [math]::Max(320,[math]::Min(3840,[int]$inputArgs.maxWidth)) } else { 1280 }
+    $format = if ($inputArgs.format) { [string]$inputArgs.format } else { 'jpeg' }
+    if ($format -notin @('jpeg','png')) { throw 'format must be jpeg or png' }
     $bitmap = New-Object System.Drawing.Bitmap($rect.Width,$rect.Height)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $small = $null; $scaledGraphics = $null; $stream = $null
     try {
         $graphics.CopyFromScreen($rect.Left,$rect.Top,0,0,$rect.Size)
+        $image = $bitmap
+        if ($rect.Width -gt $maxWidth) {
+            $height = [math]::Max(1,[int]($rect.Height*$maxWidth/$rect.Width))
+            $small = New-Object System.Drawing.Bitmap($maxWidth,$height)
+            $scaledGraphics = [System.Drawing.Graphics]::FromImage($small)
+            $scaledGraphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $scaledGraphics.DrawImage($bitmap,0,0,$maxWidth,$height); $image = $small
+        }
+        $width = $image.Width; $height = $image.Height
         $stream = New-Object System.IO.MemoryStream
-        $bitmap.Save($stream,[System.Drawing.Imaging.ImageFormat]::Png)
-        $bytes = $stream.ToArray()
-    } finally { $graphics.Dispose(); $bitmap.Dispose(); if ($stream) { $stream.Dispose() } }
-    return [ordered]@{ content=@(
-        [ordered]@{ type='image'; data=[Convert]::ToBase64String($bytes); mimeType='image/png' },
-        [ordered]@{ type='text'; text="Captured $($rect.Width)x$($rect.Height) PNG" }
-    ); structuredContent=[ordered]@{ width=$rect.Width; height=$rect.Height; bytes=$bytes.Length } }
-}function Call-Tool($name, $inputArgs) {
+        $imageFormat = if ($format -eq 'png') { [System.Drawing.Imaging.ImageFormat]::Png } else { [System.Drawing.Imaging.ImageFormat]::Jpeg }
+        $image.Save($stream,$imageFormat); $bytes = $stream.ToArray()
+        $saved = $null
+        if ($inputArgs.saveTo) {
+            if (-not [System.IO.Path]::IsPathRooted([string]$inputArgs.saveTo)) { throw 'saveTo must be an absolute path' }
+            $saved = [System.IO.Path]::GetFullPath([string]$inputArgs.saveTo)
+            if ([System.IO.File]::Exists($saved)) { throw 'saveTo already exists; choose a new path' }
+            [System.IO.File]::WriteAllBytes($saved,$bytes)
+        }
+    } finally {
+        if ($scaledGraphics) { $scaledGraphics.Dispose() }; if ($small) { $small.Dispose() }
+        $graphics.Dispose(); $bitmap.Dispose(); if ($stream) { $stream.Dispose() }
+    }
+    $items = @([ordered]@{type='text'; text="Captured $($width)x$($height) $format ($($bytes.Length) bytes)"})
+    if ($null -eq $inputArgs.includeImage -or $inputArgs.includeImage) {
+        $items += [ordered]@{type='image'; data=[Convert]::ToBase64String($bytes); mimeType="image/$format"}
+    }
+    return [ordered]@{content=$items; structuredContent=[ordered]@{
+        width=$width; height=$height; originalWidth=$rect.Width; originalHeight=$rect.Height
+        bytes=$bytes.Length; format=$format; path=$saved
+    }}
+}
+function Control-Details($inputArgs) {
+    $element = Find-Control $inputArgs
+    $data = Element-Data $element
+    $data.isPassword = $element.Current.IsPassword
+    $pattern = $null
+    if (-not $data.isPassword -and $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern,[ref]$pattern)) {
+        $data.value = ([System.Windows.Automation.ValuePattern]$pattern).Current.Value
+        $data.readOnly = ([System.Windows.Automation.ValuePattern]$pattern).Current.IsReadOnly
+    }
+    $pattern = $null
+    if ($element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern,[ref]$pattern)) {
+        $data.toggleState = [string]([System.Windows.Automation.TogglePattern]$pattern).Current.ToggleState
+    }
+    $pattern = $null
+    if ($element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern,[ref]$pattern)) {
+        $data.selected = ([System.Windows.Automation.SelectionItemPattern]$pattern).Current.IsSelected
+    }
+    return $data
+}
+function Call-Tool($name, $inputArgs) {
     switch ($name) {
-        'list_windows' { return Text-Result (List-Windows $inputArgs) }
-        'list_controls' { return Text-Result (List-Controls $inputArgs) }
+        'list_windows' { return Text-Result ([ordered]@{windows=@(List-Windows $inputArgs)}) }
+        'list_controls' { return Text-Result ([ordered]@{controls=@(List-Controls $inputArgs)}) }
+        'get_control_details' { return Text-Result (Control-Details $inputArgs) }
         'invoke_control' { return Text-Result (Invoke-Control $inputArgs) }
         'set_control_value' { return Text-Result (Set-ControlValue $inputArgs) }
         'select_control' { return Text-Result (Select-Control $inputArgs) }
@@ -215,7 +280,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         if ($method -eq 'initialize') {
             Send-Result $request.id ([ordered]@{
                 protocolVersion='2025-03-26'; capabilities=[ordered]@{ tools=[ordered]@{} }
-                serverInfo=[ordered]@{ name='windows-automation-mcp'; version='1.0.0' }
+                serverInfo=[ordered]@{ name='windows-automation-mcp'; version='1.2.0' }
             })
         } elseif ($method -eq 'tools/list') {
             Send-Result $request.id ([ordered]@{ tools=@(Get-Tools) })

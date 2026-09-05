@@ -137,6 +137,7 @@ def render(cfg=None):
             out.append("\t\trewrite * /_inspect/%s" % svc["id"])
             out.append("\t\treverse_proxy 127.0.0.1:%d {" % inspector_port)
             out.append("\t\t\tflush_interval -1")   # never buffer: SSE must stream
+            out.append("\t\t\tstream_close_delay 5m")  # keep active streams across reload
             out.append("\t\t\ttransport http {")
             out.append("\t\t\t\tversions 1.1")
             out.append("\t\t\t}")
