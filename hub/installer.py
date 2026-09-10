@@ -117,20 +117,29 @@ def detect():
         "detail": "Входит в Node.js и отдельно не устанавливается.",
     })
 
-    supergateway = _npm_package_info("supergateway")
+    fixed_root = os.path.join(str(config.ROOT), "tools", "supergateway-fixed")
+    fixed_manifest = os.path.join(fixed_root, "node_modules", "supergateway", "package.json")
+    supergateway = None
+    if os.path.isfile(fixed_manifest):
+        try:
+            with open(fixed_manifest, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            supergateway = {"path": fixed_manifest, "version": manifest.get("version")}
+        except (OSError, ValueError):
+            supergateway = None
     items.append({
         "id": "supergateway",
-        "name": "supergateway",
-        "purpose": "превращает stdio-MCP в Streamable HTTP",
+        "name": "supergateway (fixed)",
+        "purpose": "превращает stdio-MCP в Streamable HTTP без падения при обрыве клиента",
         "required": False,
         "found": supergateway is not None,
         "path": supergateway.get("path") if supergateway else None,
         "version": supergateway.get("version") if supergateway else None,
         "installable": npx is not None,
-        "sizeHint": "~8 МБ в кеше npm",
+        "sizeHint": "~18 МБ локально",
         "group": "bridge",
         "dependsOn": ["node", "npx"],
-        "detail": "Мост между локальным stdio-процессом и потоковым HTTP-интерфейсом MCP Hub.",
+        "detail": "Локально закреплённый и исправленный мост stdio → Streamable HTTP.",
     })
 
     desktop = _npm_package_info("@wonderwhy-er/desktop-commander")
@@ -819,7 +828,26 @@ def _warm_npm_package(job, package, label, version="latest"):
 
 
 def _warm_supergateway(job):
-    return _warm_npm_package(job, "supergateway", "supergateway")
+    prefix = os.path.join(str(config.ROOT), "tools", "supergateway-fixed")
+    package_json = os.path.join(prefix, "package.json")
+    patched_entry = os.path.join(
+        prefix, "supergateway", "dist", "gateways", "stdioToStatefulStreamableHttp.js")
+    if not os.path.isfile(package_json) or not os.path.isfile(patched_entry):
+        return job.fail("Исправленный supergateway отсутствует в поставке", "verify",
+                        ["Обновите MCP Hub из репозитория", "Повторите установку"])
+    job.log("Устанавливаю зависимости исправленного supergateway…", 20,
+            detail="npm устанавливает закреплённую версию 3.4.3…",
+            phase="download", indeterminate=True)
+    command = 'npm install --prefix "%s" --omit=dev --loglevel=notice' % prefix
+    code, out = _run_streaming(job, command, timeout=600)
+    if code != 0:
+        kind, message, recovery = _npm_failure(out, code)
+        return job.fail(message, kind, recovery)
+    manifest = os.path.join(prefix, "node_modules", "supergateway", "package.json")
+    if not os.path.isfile(manifest):
+        return job.fail("npm завершился успешно, но локальный supergateway не найден",
+                        "verify", ["Нажмите «Перепроверить»", "Повторите установку"])
+    job.done(True, "Исправленный supergateway 3.4.3 готов")
 
 
 def _warm_desktop_commander(job):

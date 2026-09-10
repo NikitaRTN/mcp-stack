@@ -47,7 +47,8 @@ def _caddy_runtime_status(cfg=None, port=None):
     info["listening"] = processes.port_open(port, info["probeHost"])
     return info
 RESTART_WINDOW = 600.0        # seconds
-RESTART_LIMIT = 3             # give up after this many restarts per window
+RESTART_LIMIT = 3             # bounded retries; attempts resume as the window expires
+STARTUP_GRACE = 20.0          # a live wrapper without a listener is stale after this
 _restarts = {}
 _lock = threading.RLock()
 
@@ -691,8 +692,13 @@ class Watchdog(threading.Thread):
                 BUS.publish("service.state", {"service": key, "state": status["state"],
                                               "detail": status["detail"]})
             if (cfg.get("autoRestart") and svc.get("enabled")
-                    and svc.get("kind") == "stdio" and status["state"] == "down"):
-                self._maybe_restart(svc)
+                    and svc.get("kind") == "stdio"):
+                if status["state"] == "down":
+                    self._maybe_restart(svc)
+                elif status["state"] == "starting":
+                    started_at = float(status.get("startedAt") or 0)
+                    if started_at and time.time() - started_at >= STARTUP_GRACE:
+                        self._maybe_restart(svc, force_restart=True)
         if config.enabled_services(cfg):
             caddy = _caddy_runtime_status(cfg)
             if self._last.get("__caddy") != caddy["listening"]:
@@ -701,20 +707,26 @@ class Watchdog(threading.Thread):
         if changed:
             BUS.publish("state.dirty", {})
 
-    def _maybe_restart(self, svc):
+    def _maybe_restart(self, svc, force_restart=False):
         now = time.time()
         history = [t for t in _restarts.get(svc["id"], []) if now - t < RESTART_WINDOW]
         if len(history) >= RESTART_LIMIT:
             BUS.publish("service.giveup", {
                 "service": svc["id"],
-                "detail": "%d перезапуска за 10 минут — автовосстановление остановлено"
+                "detail": "%d перезапуска за 10 минут — следующая попытка после паузы"
                           % len(history),
             })
             return
         history.append(now)
         _restarts[svc["id"]] = history
         try:
-            start_service(svc["id"])
-            BUS.publish("service.autorestart", {"service": svc["id"], "attempt": len(history)})
+            if force_restart:
+                restart_service(svc["id"])
+            else:
+                start_service(svc["id"])
+            BUS.publish("service.autorestart", {
+                "service": svc["id"], "attempt": len(history),
+                "forced": bool(force_restart),
+            })
         except ValueError as exc:
             BUS.publish("service.giveup", {"service": svc["id"], "detail": str(exc)})

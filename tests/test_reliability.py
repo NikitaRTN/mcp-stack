@@ -38,3 +38,27 @@ class ReliabilityTests(unittest.TestCase):
         msg={"jsonrpc":"2.0","id":1,"result":{"data":"a"*100000}}
         stream=io.BytesIO(b"data: "+json.dumps(msg).encode()+b"\n\n")
         self.assertEqual(client._read_sse(stream,1),msg)
+
+    def test_watchdog_restarts_stale_live_wrapper(self):
+        svc={"id":"dc","enabled":True,"kind":"stdio"}
+        status={"state":"starting","detail":"port closed","startedAt":supervisor.time.time()-supervisor.STARTUP_GRACE-1}
+        watchdog=supervisor.Watchdog()
+        with mock.patch.object(config,"load",return_value={"autoRestart":True}), mock.patch.object(config,"services",return_value=[svc]), mock.patch.object(config,"enabled_services",return_value=[]), mock.patch.object(supervisor,"service_status",return_value=status), mock.patch.object(watchdog,"_maybe_restart") as restart:
+            watchdog._tick()
+            restart.assert_called_once_with(svc,force_restart=True)
+
+    def test_watchdog_leaves_young_starting_service_alone(self):
+        svc={"id":"dc","enabled":True,"kind":"stdio"}
+        status={"state":"starting","detail":"warming up","startedAt":supervisor.time.time()}
+        watchdog=supervisor.Watchdog()
+        with mock.patch.object(config,"load",return_value={"autoRestart":True}), mock.patch.object(config,"services",return_value=[svc]), mock.patch.object(config,"enabled_services",return_value=[]), mock.patch.object(supervisor,"service_status",return_value=status), mock.patch.object(watchdog,"_maybe_restart") as restart:
+            watchdog._tick()
+            restart.assert_not_called()
+
+    def test_forced_recovery_restarts_live_process_tree(self):
+        svc={"id":"dc"}
+        watchdog=supervisor.Watchdog()
+        with mock.patch.object(supervisor,"_restarts",{}), mock.patch.object(supervisor,"restart_service") as restart, mock.patch.object(supervisor,"start_service") as start:
+            watchdog._maybe_restart(svc,force_restart=True)
+            restart.assert_called_once_with("dc")
+            start.assert_not_called()

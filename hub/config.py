@@ -46,8 +46,10 @@ DEFAULT_SERVICES = [
         "port": 8000,
         "upstreamPath": "/mcp",
         "command": (
-            "npx -y supergateway --stdio \"npx -y @wonderwhy-er/desktop-commander@0.2.48\" "
-            "--port {port} --outputTransport streamableHttp --stateful"
+            "node \"{supergateway}\" --stdio "
+            "\"npx -y @wonderwhy-er/desktop-commander@0.2.48\" "
+            "--port {port} --outputTransport streamableHttp --stateful "
+            "--sessionTimeout 300000 --logLevel none"
         ),
         "requires": ["node"],
         "builtin": True,
@@ -483,10 +485,14 @@ def expand_command(svc):
     if local:
         roblox_bat = str(Path(local) / "Roblox" / "mcp.bat")
     windows_mcp = str(ROOT / "tools" / "windows_mcp.cmd")
+    supergateway = str(
+        ROOT / "tools" / "supergateway-fixed" / "supergateway" / "dist" / "index.js"
+    )
     return (svc.get("command") or "").format(
         port=int(svc.get("port") or 0),
         robloxBat=roblox_bat,
         windowsMcp=windows_mcp,
+        supergateway=supergateway,
     )
 
 

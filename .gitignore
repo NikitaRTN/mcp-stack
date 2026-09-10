@@ -9,3 +9,6 @@ __pycache__/
 *.py[cod]
 .DS_Store
 Thumbs.db
+
+# Local npm dependencies are restored by the installer
+node_modules/
