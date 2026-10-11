@@ -43,30 +43,30 @@ def req(method,rid=1):
  c=http.client.HTTPConnection('127.0.0.1',server.server_port,timeout=3);body=json.dumps({'jsonrpc':'2.0','method':method,**({'id':rid} if rid is not None else {}),'params':{'name':'read_file','arguments':{'path':'fixture.txt'}}})
  c.request('POST','/_inspect/test',body,{'Content-Type':'application/json'});r=c.getresponse();raw=r.read();status=r.status;c.close();return status,raw
 
-def finished(method):
+def finished(method,rpc_id=None,service='test'):
  end=time.monotonic()+2
  while time.monotonic()<end:
   rows=telemetry.list_calls(include_trace=True)
-  row=next((x for x in rows if x['method']==method and x['status']!='running'),None)
+  row=next((x for x in rows if x['service']==service and x['method']==method and x['status']!='running' and (rpc_id is None or str(x['rpc_id'])==str(rpc_id))),None)
   if row:return row
   time.sleep(.005)
  raise AssertionError('No finished row: '+method)
 class Tests(unittest.TestCase):
  def test_01_json(self):
-  self.assertEqual(req('json')[0],200);row=finished('json');t=row['trace'];self.assertTrue(t['complete']);self.assertEqual(t['scope'],'inspector');self.assertEqual(row['status'],'ok');self.assertEqual(len(t['stages']),8);self.assertTrue(all(s['duration_ms']>=0 for s in t['stages']));self.assertAlmostEqual(sum(s['duration_ms'] for s in t['stages']),t['total_ms'],places=2);fixture.append(row)
+  self.assertEqual(req('json')[0],200);row=finished('json',1);t=row['trace'];self.assertTrue(t['complete']);self.assertEqual(t['scope'],'inspector');self.assertEqual(row['status'],'ok');self.assertEqual(len(t['stages']),8);self.assertTrue(all(s['duration_ms']>=0 for s in t['stages']));self.assertAlmostEqual(sum(s['duration_ms'] for s in t['stages']),t['total_ms'],places=2);fixture.append(row)
  def test_02_sse(self):
-  status,body=req('sse',2);self.assertEqual(status,200);self.assertIn('Тест: данные получены',body.decode());row=finished('sse');self.assertEqual(row['status'],'ok');self.assertEqual(row['trace']['transport'],'SSE');self.assertGreater(len(row['trace']['events']),8);self.assertAlmostEqual(sum(s['duration_ms'] for s in row['trace']['stages']),row['trace']['total_ms'],places=2);fixture.append(row)
+  status,body=req('sse',2);self.assertEqual(status,200);self.assertIn('Тест: данные получены',body.decode());row=finished('sse',2);self.assertEqual(row['status'],'ok');self.assertEqual(row['trace']['transport'],'SSE');self.assertGreater(len(row['trace']['events']),8);self.assertAlmostEqual(sum(s['duration_ms'] for s in row['trace']['stages']),row['trace']['total_ms'],places=2);fixture.append(row)
  def test_03_notification(self):
   self.assertEqual(req('notifications/initialized',None)[0],202);row=finished('notifications/initialized');self.assertGreater(row['duration_ms'],10);self.assertEqual(row['status'],'ok');fixture.append(row)
  def test_04_error(self):
-  self.assertEqual(req('fail',4)[0],500);row=finished('fail');self.assertEqual(row['status'],'error');self.assertEqual(row['trace']['failed_stage'],'receive');fixture.append(row)
+  self.assertEqual(req('fail',4)[0],500);row=finished('fail',4);self.assertEqual(row['status'],'error');self.assertEqual(row['trace']['failed_stage'],'receive');fixture.append(row)
  def test_05_live(self):
   worker=threading.Thread(target=lambda:req('slow',5));worker.start();deadline=time.monotonic()+1;live=None
   while time.monotonic()<deadline:
    live=next((r for r in telemetry.list_calls(include_trace=True) if r['method']=='slow' and r['status']=='running'),None)
    if live and live['trace']['phase']=='receive':break
    time.sleep(.001)
-  self.assertIsNotNone(live);self.assertFalse(live['trace']['complete']);self.assertIsNotNone(live['trace']['phase']);worker.join();fixture.append(finished('slow'))
+  self.assertIsNotNone(live);self.assertFalse(live['trace']['complete']);self.assertIsNotNone(live['trace']['phase']);worker.join();fixture.append(finished('slow',5))
  def test_06_bounded_events(self):
   t=rt.RequestTrace()
   for _ in range(200):t.enter('receive');t.enter('forward')
@@ -78,9 +78,18 @@ class Tests(unittest.TestCase):
  def test_09_malformed_json_passthrough(self):
   scanner=inspector.SseScanner();self.assertEqual(scanner.feed(b'data: not-json\n\n'),[]);self.assertEqual(scanner.feed(b'data: {"id":2}\n\n'),[{'id':2}])
  def test_10_trace_does_not_include_payload(self):
-  row=finished('json');t=json.dumps(row['trace']);self.assertNotIn('fixture.txt',t);self.assertNotIn('Authorization',t);self.assertNotIn('arguments',t)
+  row=finished('json',1);t=json.dumps(row['trace']);self.assertNotIn('fixture.txt',t);self.assertNotIn('Authorization',t);self.assertNotIn('arguments',t)
  def test_11_actual_tools_call(self):
-  status,_=req('tools/call',11);self.assertEqual(status,200);row=finished('tools/call');self.assertEqual(row['tool'],'read_file');self.assertEqual(row['status'],'ok');fixture.append(row)
+  status,_=req('tools/call',11);self.assertEqual(status,200);row=finished('tools/call',11);self.assertEqual(row['tool'],'read_file');self.assertEqual(row['status'],'ok');fixture.append(row)
+
+ def test_12_waits_for_exact_service_and_rpc(self):
+  other_service=telemetry.begin('old','collision',rpc_id=13);telemetry.finish(other_service,'ok')
+  other_rpc=telemetry.begin('test','collision',rpc_id=14);telemetry.finish(other_rpc,'ok')
+  wanted=telemetry.begin('test','collision',rpc_id=13)
+  timer=threading.Timer(.025,lambda:telemetry.finish(wanted,'ok'));timer.start()
+  try:
+   row=finished('collision',13);self.assertEqual(row['id'],wanted);self.assertEqual(row['service'],'test');self.assertEqual(row['rpc_id'],'13')
+  finally:timer.join(timeout=2)
 
 _CLOSED=False
 def tearDownModule():
