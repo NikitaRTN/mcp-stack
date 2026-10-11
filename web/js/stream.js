@@ -13,7 +13,7 @@ import { diag } from "./diag.js"
 import { userIsBusy } from "./util.js"
 
 const EVENT_KINDS = [
-	"call.started", "call.finished", "state.dirty", "service.state", "service.toggled",
+	"call.started", "call.finished", "call.trace", "state.dirty", "service.state", "service.toggled",
 	"service.changed", "install.progress", "install.finished", "service.unreachable",
 	"service.giveup", "calls.purged", "log.entry", "log.overflow", "log.cleared",
 ]

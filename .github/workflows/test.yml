@@ -24,7 +24,11 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: JavaScript syntax
         if: runner.os == 'Linux'
-        run: node --check web/app.js
+        run: |
+          node --check web/app.js
+          for file in web/js/*.js; do
+            node --input-type=module --check < "$file"
+          done
       - name: Windows MCP smoke
         if: runner.os == 'Windows'
         shell: pwsh

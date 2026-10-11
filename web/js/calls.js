@@ -1,84 +1,36 @@
-import { el, clear, setText, fmtTime, fmtDateTime, fmtMs, debounce, pretty, download } from './util.js'
+import { el, clear, setText, fmtTime, debounce, download, pretty } from './util.js'
 import { rpc } from './api.js'
-import { card, empty, statusBadge, openDrawer, reportError, confirmDialog, toast, segmented, pill } from './ui.js'
+import { statusBadge, reportError, confirmDialog, toast } from './ui.js'
+import { mountTrace, traceMs } from './trace-view.js?v=20261011-trace1'
 
-const rows = new Map()
-let root, body, stream, newButton, countText, follow = true, buffered = 0
-let filters = { status: 'all', tool: '', search: '' }
-let disposed = false
-// ID выбранного сервиса (null — общий журнал). Доступен всем функциям модуля.
-let activeService = null
-
-function cell(cls, text) { return el('td' + (cls ? '.' + cls : ''), { text }) }
-function statusKind(s) { return ['error','timeout'].includes(s) ? 'is-failed' : s === 'running' ? 'is-running' : '' }
-
-function patchRow(row, call, fresh=false) {
-  row.className = 'clickable ' + statusKind(call.status) + (fresh ? ' is-new' : '')
-  row.dataset.id = call.id
-  const values = [fmtTime(call.started), call.service || '—', call.tool || call.method || '—', call.status || '—', fmtMs(call.duration_ms ?? call.durationMs)]
-  values.forEach((v,i)=>setText(row.children[i],v))
-  row.onclick = () => showDetail(call.id)
-}
-
-function makeRow(call, fresh=false) {
-  const row = el('tr', null, [cell('num',''),cell('',''),cell('nowrap',''),cell('',''),cell('num','')])
-  patchRow(row,call,fresh); rows.set(String(call.id),row); return row
-}
-
-function replaceCalls(calls) {
-  // Дополнительная защита UI: сервисная вкладка никогда не показывает чужие строки,
-  // даже если старый backend или кэш вернул общий список.
-  const scoped = activeService ? calls.filter(call => call.service === activeService) : calls
-  const top = stream.scrollTop
-  const wanted = new Set(scoped.map(c=>String(c.id)))
-  for (const [id,row] of rows) if (!wanted.has(id)) { row.remove(); rows.delete(id) }
-  const frag = document.createDocumentFragment()
-  for (const call of scoped) {
-    const id=String(call.id); let row=rows.get(id)
-    if (!row) row=makeRow(call)
-    else patchRow(row,call)
-    frag.append(row)
-  }
-  body.append(frag)
-  stream.scrollTop = top
-  setText(countText, scoped.length + ' записей')
-}
-
-async function load() {
-  try {
-    const result=await rpc('calls.list',{limit:300,service:activeService||null,status:filters.status==='all'?null:filters.status,tool:filters.tool||null,search:filters.search||null},{quiet:true})
-    if (!disposed) replaceCalls(result.calls||[])
-  } catch(e) { reportError(e,'Журнал вызовов') }
-}
-
-async function showDetail(id) {
-  try {
-    const result=await rpc('calls.detail',{id})
-    const c=result.call||{}
-    openDrawer({title:(c.tool||c.method||'Вызов')+' · #'+id,subtitle:fmtDateTime(c.started),json:pretty(c),body:el('div',null,[
-      el('div.row-actions',null,[statusBadge(c.status)]),
-      el('pre.log',{text:pretty(c)})
-    ])})
-  } catch(e) { reportError(e,'Детали вызова') }
-}
-
-export function mountCalls(host, service=null) {
-  disposed=false; rows.clear(); filters={status:'all',tool:'',search:''}; activeService=service||null; buffered=0
-  const seg=segmented([{id:'all',label:'Все'},{id:'ok',label:'Успешные'},{id:'failed',label:'Ошибки'},{id:'running',label:'Активные'}],'all',v=>{filters.status=v;load()})
-  const search=el('input',{type:'search',placeholder:'Метод, инструмент, ошибка…','aria-label':'Поиск'})
-  search.oninput=debounce(()=>{filters.search=search.value.trim();load()},300)
-  const tool=el('input',{type:'text',placeholder:'Инструмент','aria-label':'Фильтр инструмента'})
-  tool.oninput=debounce(()=>{filters.tool=tool.value.trim();load()},300)
-  const followPill=pill('Следить',true,v=>{follow=v})
-  const exportBtn=el('button.btn.ghost.small',{type:'button',onclick:async()=>{const r=await rpc('calls.list',{limit:1000,service});download('mcp-calls.ndjson',(r.calls||[]).map(JSON.stringify).join('\n'),'application/x-ndjson')}},'Скачать NDJSON')
-  const purge=el('button.btn.danger.small',{type:'button',onclick:async()=>{if(await confirmDialog('Удалить записи журнала вызовов?',{okLabel:'Удалить'})){await rpc('calls.purge',{service});toast('Журнал очищен','ok');load()}}},'Очистить')
-  stream=el('div.stream.tall.calls-stream')
-  newButton=el('button.new-pill.is-hidden',{type:'button',onclick:()=>{buffered=0;newButton.classList.add('is-hidden');stream.scrollTop=0;load()}},'Новые записи')
-  body=el('tbody')
-  const table=el('table.calls-table',null,[el('colgroup',null,[el('col',{style:'width:14%'}),el('col',{style:'width:18%'}),el('col'),el('col',{style:'width:16%'}),el('col',{style:'width:14%'})]),el('thead',null,el('tr',null,['Время','Сервис','Метод / инструмент','Статус','Длительность'].map(x=>el('th',{text:x})))),body])
-  stream.append(newButton,table)
-  countText=el('span',{text:'Загрузка…'})
-  root=card(service?'Логи выбранного MCP':'Журнал MCP',service?'Показываются только вызовы выбранного сервиса.':'Показываются вызовы всех MCP-сервисов.',[exportBtn,purge],[el('div.filters',null,[seg,tool,search,followPill]),stream,el('div.stream-foot',null,[countText,el('span',{text:'До 300 строк в DOM'})])])
-  clear(host).append(root); load()
-  return {destroy(){disposed=true},onStarted(call){if(service&&call.service!==service)return;if(follow&&stream.scrollTop<12&&!filters.search&&!filters.tool&&filters.status==='all'){body.prepend(makeRow({...call,status:'running',started:Date.now()/1000},true));while(body.children.length>300)body.lastChild.remove()}else{buffered++;setText(newButton,buffered+' новых');newButton.classList.remove('is-hidden')}},onFinished(call){if(service&&call.service!==service)return;const row=rows.get(String(call.id));if(row)patchRow(row,{...call,duration_ms:call.durationMs});else if(follow&&stream.scrollTop<12)load()}}
+export function mountCalls(host, service=null){
+ let disposed=false,selectedId=null,selectedRequest=0,loadRequest=0,follow=true,buffered=0,connection='online'
+ const rows=new Map(),records=new Map(),filters={status:'all',search:''}
+ const detailHost=el('div.task-detail-host'),traceView=mountTrace(detailHost)
+ const body=el('div.task-list',{role:'list','aria-label':'Задачи MCP'}),count=el('span',{text:'Загрузка…'}),active=el('span',{text:'Живой журнал'})
+ const listEmpty=el('div.task-list-empty',null,[el('strong',{text:'Пока нет задач'}),el('p.muted',{text:'Новые запросы появятся здесь автоматически. Попробуйте изменить фильтр.'})])
+ const newButton=el('button.task-new.is-hidden',{type:'button',onclick:()=>{buffered=0;newButton.classList.add('is-hidden');load()}},'Новые задачи')
+ const seg=el('div.task-filter-tabs',{'aria-label':'Фильтр задач'});const filterButtons=new Map()
+ for(const [key,label]of [['all','Все'],['running','Активные'],['failed','Ошибки'],['ok','Готовые']]){const b=el('button',{type:'button','aria-pressed':key==='all'?'true':'false',onclick:()=>{filters.status=key;for(const[k,n]of filterButtons)n.setAttribute('aria-pressed',String(k===key));load()}},label);filterButtons.set(key,b);seg.append(b)}
+ const search=el('input.task-search',{type:'search',placeholder:'Поиск запросов…','aria-label':'Поиск задач'});search.oninput=debounce(()=>{filters.search=search.value.trim();load()},250)
+ const followBtn=el('button.btn.ghost',{type:'button','aria-pressed':'true',onclick:()=>{follow=!follow;followBtn.setAttribute('aria-pressed',String(follow));setText(followBtn,follow?'● Live':'Пауза списка');if(follow)load()}},'● Live')
+ const exportBtn=el('button.btn.ghost',{type:'button',onclick:async()=>{try{const r=await rpc('calls.list',{limit:1000,service,includeTrace:true});download('mcp-tasks.ndjson',(r.calls||[]).map(JSON.stringify).join('\n'),'application/x-ndjson')}catch(e){reportError(e,'Экспорт журнала')}}},'Экспорт')
+ const purge=el('button.btn.ghost.task-purge',{type:'button',onclick:async()=>{if(await confirmDialog('Удалить задачи и их трассировки из журнала?',{okLabel:'Удалить'})){await rpc('calls.purge',{service});selectedId=null;records.clear();rows.clear();traceView.update(null);await load();toast('Журнал очищен','ok')}}},'Очистить')
+ const listPane=el('aside.task-list-pane',null,[el('div.task-list-head',null,[el('div',null,[el('span.eyebrow',{text:'REQUESTS'}),el('h2',{text:service?'Задачи сервиса':'Поток задач'})]),active]),search,seg,newButton,body,el('div.task-list-footer',null,[count,el('span',{text:'Последние 300'})])])
+ const root=el('section.task-explorer',null,[el('div.task-explorer-intro',null,[el('div',null,[el('h2',{text:'От запроса до ответа'}),el('p.muted',{text:'Живая схема, точные миллисекунды и история прохождения сигнала.'})]),el('div.row-actions',null,[followBtn,exportBtn,purge])]),el('div.task-workspace',null,[listPane,detailHost])]);clear(host).append(root)
+ function matches(c){if(service&&c.service!==service)return false;if(filters.status==='running'&&c.status!=='running')return false;if(filters.status==='ok'&&c.status!=='ok')return false;if(filters.status==='failed'&&!['error','timeout','cancelled'].includes(c.status))return false;return !filters.search||(c.tool+' '+c.method+' '+(c.error||'')).toLowerCase().includes(filters.search.toLowerCase())}
+ function rowFor(c){const id=String(c.id);let r=rows.get(id);if(!r){const name=el('strong.task-row-name'),meta=el('span.task-row-meta'),time=el('span.task-row-time'),status=el('span.task-row-status'),duration=el('span.task-row-duration');const node=el('button.task-row',{type:'button',role:'listitem',dataset:{id},onclick:()=>select(c.id)},[el('span.task-row-status-dot',{'aria-hidden':'true'}),el('div.task-row-copy',null,[name,meta,el('div.task-row-foot',null,[time,status])]),duration]);r={node,name,meta,time,status,duration};rows.set(id,r)}r.node.className='task-row '+(c.status||'')+(String(selectedId)===id?' selected':'');r.node.setAttribute('aria-pressed',String(String(selectedId)===id));setText(r.name,c.tool||c.method||'HTTP-запрос');r.name.title=r.name.textContent;setText(r.meta,(c.service||'MCP')+' / #'+id+(c.trace?.id?' / trace':' / архив'));setText(r.time,fmtTime(c.started));setText(r.status,({ok:'Готово',running:'В работе',error:'Ошибка',timeout:'Таймаут',cancelled:'Отменено'})[c.status]||c.status||'—');setText(r.duration,c.status==='running'?'…':traceMs(c.duration_ms??c.durationMs??c.trace?.total_ms));return r.node}
+ function patchCounts(){setText(count,body.querySelectorAll('.task-row').length+' задач');setText(active,connection==='online'?'● Live':'Нет потока')}
+ function replace(calls){const scoped=calls.filter(matches),wanted=new Set(scoped.map(c=>String(c.id)));for(const[id,row]of rows)if(!wanted.has(id)){row.node.remove();rows.delete(id);records.delete(id)}const frag=document.createDocumentFragment();for(const c of scoped){records.set(String(c.id),c);frag.append(rowFor(c))}body.append(frag);listEmpty.remove();if(!scoped.length)body.append(listEmpty);patchCounts();if(selectedId===null&&scoped.length)select((scoped.find(c=>c.status==='running')||scoped[0]).id)}
+ async function load(){const generation=++loadRequest;try{const r=await rpc('calls.list',{limit:300,service,status:filters.status==='all'?null:filters.status,search:filters.search||null},{quiet:true});if(!disposed&&generation===loadRequest)replace(r.calls||[])}catch(e){if(!disposed)reportError(e,'Задачи MCP')}}
+ async function select(id){selectedId=id;const generation=++selectedRequest;for(const [key,r]of rows){r.node.classList.toggle('selected',key===String(id));r.node.setAttribute('aria-pressed',String(key===String(id)))}try{const r=await rpc('calls.detail',{id},{quiet:true});if(!disposed&&generation===selectedRequest){traceView.update(r.call||null);traceView.onConnection(connection)}}catch(e){if(!disposed&&generation===selectedRequest)reportError(e,'Трассировка задачи')}}
+ load()
+ return{
+  destroy(){disposed=true;traceView.destroy()},
+  onStarted(c){if(disposed||service&&c.service!==service)return;const next={...c,status:'running',started:c.started||Date.now()/1000};if(!matches(next))return;if(follow&&!filters.search){records.set(String(c.id),next);listEmpty.remove();body.prepend(rowFor(next));while(body.querySelectorAll('.task-row').length>300){const last=body.lastElementChild,id=last.dataset.id;last.remove();rows.delete(id);records.delete(id)}patchCounts();if(selectedId===null)select(c.id)}else{buffered++;setText(newButton,buffered+' новых задач');newButton.classList.remove('is-hidden')}},
+  onFinished(c){if(disposed||service&&c.service!==service)return;const id=String(c.id),next={...records.get(id),...c,duration_ms:c.durationMs??c.duration_ms};if(rows.has(id)||String(selectedId)===id)records.set(id,next);if(rows.has(id)){if(matches(next))rowFor(next);else{rows.get(id).node.remove();rows.delete(id)}}else if(follow)load();if(String(selectedId)===id)select(c.id);patchCounts()},
+  onTrace(e){if(disposed||!e?.trace)return;for(const id of e.ids||[]){const c=records.get(String(id));if(c){c.trace={...c.trace,...e.trace};const r=rows.get(String(id));if(r&&c.status==='running')setText(r.duration,'~ '+traceMs(e.trace.total_ms))}if(String(selectedId)===String(id))traceView.progress(e.trace)}},
+  onConnection(status){const was=connection;connection=status;traceView.onConnection(status);patchCounts();if(was!=='online'&&status==='online'){load();if(selectedId!==null)select(selectedId)}},
+  reload:load,
+ }
 }

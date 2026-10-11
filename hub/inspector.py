@@ -21,6 +21,7 @@ from . import config
 from . import oauth
 from . import telemetry
 from .events import BUS
+from .request_trace import RequestTrace
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -148,6 +149,8 @@ class InspectorHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        if hasattr(self, "_trace"):
+            self._trace.bytes_sent += len(body)
 
     def _rpc_error(self, status, message, code=-32000):
         self._json(status, {"jsonrpc": "2.0", "error": {"code": code, "message": message},
@@ -194,6 +197,9 @@ class InspectorHandler(BaseHTTPRequestHandler):
         return sid, ("/" + tail if tail else "")
 
     def _proxy(self, method):
+        self._trace = RequestTrace()
+        self._trace_last_event = 0.0
+        self._trace_failure_phase = None
         sid, _tail = self._resolve()
         if not sid:
             return self._rpc_error(404, "Неизвестный маршрут инспектора")
@@ -217,11 +223,14 @@ class InspectorHandler(BaseHTTPRequestHandler):
             return self._rpc_error(503, "У сервиса не задан upstream")
         host, port, base_path, scheme = target
 
+        self._trace.enter("body")
         length = int(self.headers.get("Content-Length") or 0)
         if length > MAX_BODY:
             return self._rpc_error(413, "Слишком большое тело запроса")
         body = self.rfile.read(length) if length else b""
 
+        self._trace.bytes_received = len(body)
+        self._trace.enter("decode")
         session = self.headers.get("mcp-session-id")
         client = self.headers.get("X-Forwarded-For") or self.client_address[0]
         pending = self._open_rows(svc, body, session, client)
@@ -229,23 +238,35 @@ class InspectorHandler(BaseHTTPRequestHandler):
         try:
             self._forward(method, host, port, base_path, scheme, body, pending, session, svc)
         except oauth.OAuthError as exc:
-            self._close_all(pending, "error", str(exc))
             self._safe_error(502, "OAuth апстрима: %s" % exc)
+            self._close_all(pending, "error", str(exc))
         except (socket.timeout, TimeoutError):
-            self._close_all(pending, "timeout", "Апстрим не ответил вовремя")
             self._upstream_problem(svc, "Апстрим не ответил вовремя")
             self._safe_error(504, "MCP не ответил вовремя")
+            self._close_all(pending, "timeout", "Апстрим не ответил вовремя")
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            phase = self._trace.snapshot().get("phase")
+            if phase == "forward":
+                self._trace_failure_phase = "forward"
+                self._close_all(pending, "cancelled", "Клиент закрыл соединение")
+            else:
+                self._safe_error(502, "Соединение с MCP прервано")
+                self._close_all(pending, "error", "Соединение с MCP прервано")
         except (ConnectionRefusedError, OSError) as exc:
-            self._close_all(pending, "error", "Нет соединения с MCP: %s" % exc)
             self._upstream_problem(svc, "Нет соединения с %s:%d" % (host, port))
             self._safe_error(502, "MCP-сервер недоступен: %s" % exc)
+            self._close_all(pending, "error", "Нет соединения с MCP: %s" % exc)
         except Exception as exc:                      # noqa: BLE001 - proxy must not die
-            self._close_all(pending, "error", str(exc))
             self._safe_error(500, "Ошибка инспектора: %s" % exc)
+            self._close_all(pending, "error", str(exc))
 
     def _safe_error(self, status, message):
         try:
+            self._trace_failure_phase = self._trace.snapshot().get("phase")
+            self._trace.enter("forward")
+            self._trace.http_status = status
             self._rpc_error(status, message)
+            self.wfile.flush()
         except OSError:
             pass
 
@@ -256,76 +277,83 @@ class InspectorHandler(BaseHTTPRequestHandler):
             rpc_id = request.get("id")
             row_id = telemetry.begin(
                 service=svc["id"], method=method, tool=tool, rpc_id=rpc_id,
-                session=session, args=args, req_bytes=len(body), client=client)
-            if rpc_id is None:
-                # Notification: no answer will ever come, close it immediately.
-                telemetry.finish(row_id, "ok", resp_bytes=0, session=session)
-            else:
-                pending[str(rpc_id)] = _Pending(row_id, method, tool, rpc_id)
+                session=session, args=args, req_bytes=len(body), client=client, trace=self._trace)
+            # Notifications are only complete once upstream acknowledgement is sent.
+            key = str(rpc_id) if rpc_id is not None else "notification:" + str(row_id)
+            pending[key] = _Pending(row_id, method, tool, rpc_id)
             CALL_COUNTER["n"] += 1
             if CALL_COUNTER["n"] % 500 == 0:
                 threading.Thread(target=telemetry.prune, daemon=True).start()
         return pending
 
+    def _phase(self, key, pending):
+        self._trace.enter(key)
+        at = time.perf_counter()
+        # Bound SSE update rate while still retaining every measured phase internally.
+        if at - self._trace_last_event >= .05 or key in ("connect", "send", "headers"):
+            self._trace_last_event = at
+            telemetry.trace_progress([e.row_id for e in pending.values()], self._trace)
+
+    def _snapshot(self, at=None):
+        result = self._trace.snapshot(at=at, complete=True)
+        result["failed_stage"] = self._trace_failure_phase
+        return result
+
     def _forward(self, method, host, port, base_path, scheme, body, pending, session, svc):
         cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
         conn = cls(host, port, timeout=UPSTREAM_CONNECT_TIMEOUT)
-        headers = {}
-        for key, value in self.headers.items():
-            if key.lower() not in HOP_BY_HOP and key.lower() != "authorization":
-                headers[key] = value
-        headers["Host"] = "%s:%d" % (host, port)
-        if svc.get("kind") == "remote":
-            upstream_auth = svc.get("upstreamAuthMode") or (
-                "bearer" if svc.get("upstreamToken") else "none")
-            if upstream_auth == "bearer" and svc.get("upstreamToken"):
-                headers["Authorization"] = "Bearer %s" % svc["upstreamToken"]
-            elif upstream_auth == "oauth":
-                token = oauth.client_credentials(
-                    svc.get("upstreamOAuth") or {}, verify_tls=bool(
-                        (svc.get("upstreamOAuth") or {}).get("verifyTls", True)))
-                headers["Authorization"] = "Bearer %s" % token
-        if body:
-            headers["Content-Length"] = str(len(body))
-
-        conn.request(method, base_path, body=body or None, headers=headers)
-        conn.sock.settimeout(None)       # streams may idle for minutes
-        response = conn.getresponse()
-
-        resp_session = response.getheader("mcp-session-id") or session
-        content_type = (response.getheader("Content-Type") or "").lower()
-        streaming = "text/event-stream" in content_type
-        # http.client transparently decodes an upstream chunked body.  For a
-        # non-SSE response we already buffer the whole payload, so frame it for
-        # the downstream connection with a fresh Content-Length.  Otherwise an
-        # upstream `Transfer-Encoding: chunked` header is removed below and the
-        # HTTP/1.1 response has neither Transfer-Encoding nor Content-Length;
-        # Caddy then waits for EOF on this persistent connection and the MCP
-        # client appears to receive an empty result.
-        payload = None if streaming else response.read()
-
-        self.send_response(response.status)
-        for key, value in response.getheaders():
-            if key.lower() in HOP_BY_HOP:
-                continue
-            self.send_header(key, value)
-        if streaming:
-            self.send_header("Transfer-Encoding", "chunked")
-            self.send_header("Cache-Control", "no-cache, no-transform")
-            self.send_header("X-Accel-Buffering", "no")
-        else:
-            self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-
-        if response.status >= 400 and pending:
-            detail = "HTTP %d от MCP-сервера" % response.status
-            self._close_all(pending, "error", detail, session=resp_session)
-
-        if streaming:
-            self._pump_stream(response, pending, resp_session)
-        else:
-            self._pump_body(payload, pending, resp_session)
-        conn.close()
+        self._response_http_error = False
+        try:
+            headers = {}
+            for key, value in self.headers.items():
+                if key.lower() not in HOP_BY_HOP and key.lower() != "authorization":
+                    headers[key] = value
+            headers["Host"] = "%s:%d" % (host, port)
+            if svc.get("kind") == "remote":
+                upstream_auth = svc.get("upstreamAuthMode") or (
+                    "bearer" if svc.get("upstreamToken") else "none")
+                if upstream_auth == "bearer" and svc.get("upstreamToken"):
+                    headers["Authorization"] = "Bearer %s" % svc["upstreamToken"]
+                elif upstream_auth == "oauth":
+                    token = oauth.client_credentials(
+                        svc.get("upstreamOAuth") or {}, verify_tls=bool(
+                            (svc.get("upstreamOAuth") or {}).get("verifyTls", True)))
+                    headers["Authorization"] = "Bearer %s" % token
+            if body:
+                headers["Content-Length"] = str(len(body))
+            self._phase("connect", pending)
+            conn.connect()
+            self._phase("send", pending)
+            conn.request(method, base_path, body=body or None, headers=headers)
+            conn.sock.settimeout(None)
+            self._phase("headers", pending)
+            response = conn.getresponse()
+            self._trace.http_status = response.status
+            self._response_http_error = response.status >= 400
+            resp_session = response.getheader("mcp-session-id") or session
+            content_type = (response.getheader("Content-Type") or "").lower()
+            streaming = "text/event-stream" in content_type
+            self._trace.transport = "SSE" if streaming else "JSON"
+            self._phase("receive", pending)
+            payload = None if streaming else response.read()
+            self._phase("forward", pending)
+            self.send_response(response.status)
+            for key, value in response.getheaders():
+                if key.lower() not in HOP_BY_HOP:
+                    self.send_header(key, value)
+            if streaming:
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Cache-Control", "no-cache, no-transform")
+                self.send_header("X-Accel-Buffering", "no")
+            else:
+                self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if streaming:
+                self._pump_stream(response, pending, resp_session)
+            else:
+                self._pump_body(payload, pending, resp_session)
+        finally:
+            conn.close()
 
     # -- response pumps ---------------------------------------------------- #
 
@@ -333,27 +361,35 @@ class InspectorHandler(BaseHTTPRequestHandler):
         if payload:
             self.wfile.write(payload)
             self.wfile.flush()
+        self._trace.bytes_sent = len(payload)
+        self._trace_reply_sent = time.perf_counter()
         self._consume(payload, pending, session, len(payload))
-        self._close_all(pending, "ok", None, session=session)
+        self._close_all(pending, "error" if self._response_http_error else "ok",
+                        "HTTP-ошибка upstream" if self._response_http_error else None, session=session)
 
     def _pump_stream(self, response, pending, session):
         scanner = SseScanner()
         total = 0
         try:
             while True:
+                self._phase("receive", pending)
                 chunk = response.read1(STREAM_CHUNK)
                 if not chunk:
                     break
                 total += len(chunk)
                 # Manual chunked framing keeps the connection reusable while
                 # still flushing every event the instant it arrives.
+                self._phase("forward", pending)
                 self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
                 self.wfile.flush()
+                self._trace.bytes_sent = total
+                self._trace_reply_sent = time.perf_counter()
                 for message in scanner.feed(chunk):
                     self._match(message, pending, session, total)
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
+            self._trace_failure_phase = "forward"
             self._close_all(pending, "cancelled", "Клиент закрыл соединение", session=session)
             return
         if pending:
@@ -380,13 +416,16 @@ class InspectorHandler(BaseHTTPRequestHandler):
         if entry is None:
             return
         status, error = classify(message)
-        telemetry.finish(entry.row_id, status, error=error, resp_bytes=size, session=session)
+        if status != "ok":
+            self._trace_failure_phase = "receive"
+        telemetry.finish(entry.row_id, status, error=error, resp_bytes=size, session=session,
+                         trace=self._snapshot(at=self._trace_reply_sent))
 
     def _close_all(self, pending, status, error, session=None, resp_bytes=0):
         while pending:
             _key, entry = pending.popitem()
             telemetry.finish(entry.row_id, status, error=error,
-                             resp_bytes=resp_bytes, session=session)
+                             resp_bytes=resp_bytes or self._trace.bytes_sent, session=session, trace=self._snapshot())
 
     def _upstream_problem(self, svc, detail):
         BUS.publish("service.unreachable", {

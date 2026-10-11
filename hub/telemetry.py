@@ -13,6 +13,7 @@ import time
 
 from . import config
 from .events import BUS
+from .request_trace import summary as trace_summary
 
 DB_PATH = config.DATA / "telemetry.db"
 ARGS_LIMIT = 4000        # keep a readable preview, never the whole payload
@@ -43,6 +44,8 @@ CREATE INDEX IF NOT EXISTS calls_status ON calls(status);
 
 _lock = threading.RLock()
 _conn = None
+_active_traces = {}
+MAX_ACTIVE_TRACES = 4096
 
 
 def connect():
@@ -55,6 +58,9 @@ def connect():
             _conn.execute("PRAGMA journal_mode=WAL")      # readers never block the proxy
             _conn.execute("PRAGMA synchronous=NORMAL")
             _conn.executescript(SCHEMA)
+            columns = {row[1] for row in _conn.execute("PRAGMA table_info(calls)")}
+            if "trace" not in columns:
+                _conn.execute("ALTER TABLE calls ADD COLUMN trace TEXT")
             _conn.commit()
         return _conn
 
@@ -69,24 +75,29 @@ def _trim(value, limit):
 
 
 def begin(service, method, tool=None, rpc_id=None, session=None, args=None,
-          req_bytes=0, client=None):
+          req_bytes=0, client=None, trace=None):
     """Record the start of a JSON-RPC call. Returns the row id."""
     conn = connect()
     with _lock:
         cur = conn.execute(
             "INSERT INTO calls (service, method, tool, rpc_id, session, started, status,"
             " args, req_bytes, client) VALUES (?,?,?,?,?,?,'running',?,?,?)",
-            (service, method, tool, str(rpc_id) if rpc_id is not None else None, session,
-             time.time(), _trim(args, ARGS_LIMIT), int(req_bytes or 0), client),
+            (_trim(service, 128), _trim(method, 256), _trim(tool, 512),
+             _trim(str(rpc_id), 512) if rpc_id is not None else None, _trim(session, 512),
+             trace.started_wall if trace is not None else time.time(), _trim(args, ARGS_LIMIT), int(req_bytes or 0), _trim(client, 512)),
         )
         conn.commit()
         row_id = cur.lastrowid
+        if trace is not None and len(_active_traces) < MAX_ACTIVE_TRACES:
+            _active_traces[row_id] = trace
     BUS.publish("call.started", {"id": row_id, "service": service, "method": method,
-                                 "tool": tool, "session": session})
+                                 "tool": tool, "session": session,
+                                 "started": trace.started_wall if trace is not None else time.time(),
+                                 "trace": trace_summary(trace.snapshot()) if trace is not None else None})
     return row_id
 
 
-def finish(row_id, status, error=None, resp_bytes=0, session=None):
+def finish(row_id, status, error=None, resp_bytes=0, session=None, trace=None):
     """Close a call row. `status` is ok | error | cancelled | timeout."""
     conn = connect()
     now = time.time()
@@ -95,19 +106,21 @@ def finish(row_id, status, error=None, resp_bytes=0, session=None):
                            (row_id,)).fetchone()
         if row is None:
             return None
-        duration = (now - float(row["started"])) * 1000.0
+        duration = (trace["total_ms"] if isinstance(trace, dict) else
+                    max(0.0, (now - float(row["started"])) * 1000.0))
         conn.execute(
             "UPDATE calls SET finished=?, duration_ms=?, status=?, error=?, resp_bytes=?,"
-            " session=COALESCE(?, session) WHERE id=?",
+            " session=COALESCE(?, session), trace=? WHERE id=?",
             (now, duration, status, _trim(error, ERROR_LIMIT), int(resp_bytes or 0),
-             session, row_id),
+             session, json.dumps(trace, ensure_ascii=False) if trace is not None else None, row_id),
         )
         conn.commit()
+        _active_traces.pop(row_id, None)
     payload = {
         "id": row_id, "service": row["service"], "method": row["method"],
         "tool": row["tool"], "status": status, "durationMs": round(duration, 1),
         "error": _trim(error, 400), "session": session or row["session"],
-        "started": row["started"], "finished": now,
+        "started": row["started"], "finished": now, "trace": trace_summary(trace),
     }
     BUS.publish("call.finished", payload)
     return payload
@@ -117,13 +130,14 @@ def abandon_running(reason="Перезапуск хаба во время выз
     """On startup, no call can still be running: close leftovers honestly."""
     conn = connect()
     with _lock:
+        _active_traces.clear()
         conn.execute(
             "UPDATE calls SET status='cancelled', error=?, finished=started "
             "WHERE status='running'", (reason,))
         conn.commit()
 
 
-def list_calls(service=None, limit=200, status=None, tool=None, search=None, since=None):
+def list_calls(service=None, limit=200, status=None, tool=None, search=None, since=None, include_trace=False):
     conn = connect()
     sql = ["SELECT * FROM calls WHERE 1=1"]
     params = []
@@ -149,7 +163,36 @@ def list_calls(service=None, limit=200, status=None, tool=None, search=None, sin
     params.append(max(1, min(int(limit or 200), 1000)))
     with _lock:
         rows = conn.execute(" ".join(sql), params).fetchall()
-    return [dict(r) for r in rows]
+    return [_decode_row(dict(r), include_trace) for r in rows]
+
+
+def _decode_row(row, full=False):
+    with _lock:
+        live = _active_traces.get(row["id"])
+    if live is not None:
+        trace = live.snapshot()
+    else:
+        try:
+            trace = json.loads(row.get("trace") or "null")
+        except (ValueError, TypeError):
+            trace = None
+    row["trace"] = trace if full else trace_summary(trace)
+    return row
+
+
+def get_call(row_id):
+    conn = connect()
+    with _lock:
+        row = conn.execute("SELECT * FROM calls WHERE id=?", (int(row_id),)).fetchone()
+    return _decode_row(dict(row), True) if row is not None else None
+
+
+def trace_progress(row_ids, trace):
+    # Memory + one bounded SSE event, no SQLite write per phase.
+    if not row_ids:
+        return
+    snapshot = trace.snapshot()
+    BUS.publish("call.trace", {"ids": list(row_ids), "trace": snapshot})
 
 
 def stats(service=None, window_sec=3600):
@@ -250,9 +293,12 @@ def purge(service=None):
     conn = connect()
     with _lock:
         if service:
+            ids = [r[0] for r in conn.execute("SELECT id FROM calls WHERE service=?", (service,))]
+            for row_id in ids: _active_traces.pop(row_id, None)
             conn.execute("DELETE FROM calls WHERE service=?", (service,))
         else:
             conn.execute("DELETE FROM calls")
+            _active_traces.clear()
         conn.commit()
     BUS.publish("calls.purged", {"service": service})
     return True

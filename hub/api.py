@@ -68,16 +68,16 @@ def calls_list(params):
             tool=params.get("tool"),
             search=params.get("search"),
             since=params.get("since"),
+            include_trace=bool(params.get("includeTrace", False)),
         )
     }
 
 
 def calls_detail(params):
     row_id = int(_need(params, "id"))
-    rows = telemetry.list_calls(limit=1000)
-    for row in rows:
-        if row["id"] == row_id:
-            return {"call": row}
+    row = telemetry.get_call(row_id)
+    if row is not None:
+        return {"call": row}
     raise RpcError("Вызов не найден", 404)
 
 
