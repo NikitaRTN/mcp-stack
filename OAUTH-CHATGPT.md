@@ -1,5 +1,7 @@
 # OAuth для ChatGPT
 
+Во всех примерах ниже mcp.example.com — условный адрес. Замените его своим доменом; эти URL не являются готовыми настройками сервера.
+
 ## Быстрое подключение
 
 1. Задайте пароль администратора MCP Hub в локальной панели.
@@ -7,7 +9,7 @@
 3. В **MCP Studio → Конфигурация → Доступ к публичному маршруту** выберите **OAuth для ChatGPT**.
 4. В блоке **OAuth-защита маршрута** оставьте **Автоматически — встроенный OAuth**.
 5. Сохраните изменения, включите MCP и перезапустите Caddy/Hub.
-6. В ChatGPT укажите только адрес MCP, например `https://mcp.riseshield.ru/roblox`.
+6. В ChatGPT укажите только адрес MCP, например `https://mcp.example.com/roblox`.
 
 ChatGPT автоматически обнаружит OAuth metadata, зарегистрирует PKCE-клиент и откроет страницу MCP Hub с вводом пароля.
 
@@ -15,11 +17,11 @@ ChatGPT автоматически обнаружит OAuth metadata, зарег
 
 Для маршрута `/roblox`:
 
-- Auth URL: `https://mcp.riseshield.ru/oauth/authorize`
-- Token URL: `https://mcp.riseshield.ru/oauth/token`
-- Registration URL: `https://mcp.riseshield.ru/oauth/register`
-- Authorization server base: `https://mcp.riseshield.ru`
-- Resource: `https://mcp.riseshield.ru/roblox`
+- Auth URL: `https://mcp.example.com/oauth/authorize`
+- Token URL: `https://mcp.example.com/oauth/token`
+- Registration URL: `https://mcp.example.com/oauth/register`
+- Authorization server base: `https://mcp.example.com`
+- Resource: `https://mcp.example.com/roblox`
 
 Для другого MCP измените только Resource на его публичный адрес.
 
@@ -27,8 +29,8 @@ ChatGPT автоматически обнаружит OAuth metadata, зарег
 
 Эти URL должны возвращать JSON:
 
-- `https://mcp.riseshield.ru/.well-known/oauth-authorization-server`
-- `https://mcp.riseshield.ru/.well-known/oauth-protected-resource/roblox`
+- `https://mcp.example.com/.well-known/oauth-authorization-server`
+- `https://mcp.example.com/.well-known/oauth-protected-resource/roblox`
 
 ## Безопасность
 

@@ -36,7 +36,7 @@ export function mountSettings(host, { getState, refresh }) {
 	const save = el("button.btn.primary", { type: "submit" }, "Сохранить порты и сеть")
 	form.append(
 		el("div.form-grid", null, [
-			field("Домен", domain, "Например mcp.riseshield.ru или localhost"),
+			field("Домен", domain, "Например mcp.example.com или localhost"),
 			field("Email для сертификата", email, "Необязательно, используется Caddy / ACME"),
 			field("Публичный HTTPS-порт", httpsPort, "Применяется сразу после проверки Caddyfile"),
 			field("Порт панели", adminPort, "После изменения потребуется перезапуск MCP Hub"),

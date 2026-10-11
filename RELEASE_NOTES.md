@@ -69,7 +69,7 @@
 - Добавлена отдельная вкладка **MCP Studio** для создания, редактирования, включения и удаления MCP без ручной правки `hub.json`.
 - Поддерживаются локальные `stdio`-команды через supergateway и уже работающие Streamable HTTP MCP.
 - Для локального MCP можно менять порт, команду и upstream path; конфликты с HTTPS, панелью, inspector и другими MCP блокируются до сохранения.
-- Tools Explorer подключается к одному выбранному MCP или произвольному URL, включая `https://mcp.riseshield.ru/roblox`.
+- Tools Explorer подключается к одному выбранному MCP или произвольному URL, включая `https://mcp.example.com/roblox`.
 - Реализованы MCP `initialize`, `notifications/initialized`, постраничный `tools/list` и `tools/call`.
 - Показаны описание и input schema каждого tool, JSON-редактор аргументов, сырой ответ и время выполнения.
 - Клиент понимает JSON и SSE, поддерживает `Mcp-Session-Id`, ограничивает размер ответа и имеет настраиваемый таймаут.

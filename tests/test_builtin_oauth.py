@@ -12,7 +12,7 @@ from hub import caddyfile, config, oauth
 class BuiltinOAuthTests(unittest.TestCase):
     def sample(self):
         cfg = json.loads(json.dumps(config.DEFAULTS))
-        cfg.update({"domain": "mcp.riseshield.ru", "httpsPort": 8443,
+        cfg.update({"domain": "mcp.example.com", "httpsPort": 8443,
                     "token": "test", "oauthSigningKey": "unit-signing-key"})
         for service in cfg["services"]:
             service["enabled"] = False
@@ -24,7 +24,7 @@ class BuiltinOAuthTests(unittest.TestCase):
 
     def test_discovery_dcr_pkce_and_resource_binding(self):
         cfg = self.sample()
-        resource = "https://mcp.riseshield.ru/roblox"
+        resource = "https://mcp.example.com/roblox"
         verifier = "unit-verifier-" + "x" * 52
         challenge = oauth._b64(hashlib.sha256(verifier.encode()).digest())
         with tempfile.TemporaryDirectory() as folder, \
@@ -58,14 +58,14 @@ class BuiltinOAuthTests(unittest.TestCase):
             denied = oauth.validate_incoming(
                 {"mode": "builtin", "requiredScopes": "mcp:tools"},
                 "Bearer " + tokens["access_token"],
-                resource="https://mcp.riseshield.ru/real")
+                resource="https://mcp.example.com/real")
             metadata = oauth.authorization_server_metadata(cfg)
             protected = oauth.protected_resource_metadata(
                 "/.well-known/oauth-protected-resource/roblox", cfg)
         self.assertEqual(allowed[:2], (True, 200))
         self.assertEqual(denied[:2], (False, 401))
         self.assertEqual(metadata["registration_endpoint"],
-                         "https://mcp.riseshield.ru/oauth/register")
+                         "https://mcp.example.com/oauth/register")
         self.assertEqual(protected["resource"], resource)
 
     def test_caddy_exposes_discovery_before_mcp(self):

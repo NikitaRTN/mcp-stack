@@ -65,10 +65,10 @@ class ConfigTests(unittest.TestCase):
 
     def test_wan_443_to_lan_8443_configuration(self):
         cfg = self.sample()
-        cfg.update({"domain": "riseshield.ru", "httpsPort": 8443, "bind": ""})
+        cfg.update({"domain": "example.com", "httpsPort": 8443, "bind": ""})
         text = caddyfile.render(cfg)
         self.assertIn("https_port 8443", text)
-        self.assertIn("riseshield.ru {", text)
+        self.assertIn("example.com {", text)
         self.assertNotIn("bind 8443", text)
 
     def test_bind_rejects_a_port_number(self):
@@ -80,7 +80,7 @@ class ConfigTests(unittest.TestCase):
 class CaddyStatusTests(unittest.TestCase):
     def sample(self):
         cfg = json.loads(json.dumps(config.DEFAULTS))
-        cfg.update({"domain": "riseshield.ru", "httpsPort": 443, "bind": ""})
+        cfg.update({"domain": "example.com", "httpsPort": 443, "bind": ""})
         return cfg
 
     def test_foreign_listener_is_not_reported_as_caddy(self):
@@ -390,14 +390,14 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 class CertificateTests(unittest.TestCase):
     def sample(self, port=443):
         cfg = json.loads(json.dumps(config.DEFAULTS))
-        cfg.update({"domain": "mcp.riseshield.ru", "httpsPort": port,
-                    "email": "admin@riseshield.ru", "token": "secret"})
+        cfg.update({"domain": "mcp.example.com", "httpsPort": port,
+                    "email": "admin@example.com", "token": "secret"})
         return cfg
 
     def test_caddy_enables_automatic_https_on_standard_port(self):
         text = caddyfile.render(self.sample(443))
         self.assertIn("automatic Let's Encrypt certificate", text)
-        self.assertIn("email admin@riseshield.ru", text)
+        self.assertIn("email admin@example.com", text)
         self.assertNotIn("auto_https off", text)
         self.assertNotIn("tls internal", text)
 
@@ -409,11 +409,11 @@ class CertificateTests(unittest.TestCase):
 
     def test_certificate_summary_distinguishes_trusted_certificate(self):
         cert = {"issuer": ((('organizationName', "Let's Encrypt"),),),
-                "subject": ((('commonName', "mcp.riseshield.ru"),),),
-                "subjectAltName": (("DNS", "mcp.riseshield.ru"),),
+                "subject": ((('commonName', "mcp.example.com"),),),
+                "subjectAltName": (("DNS", "mcp.example.com"),),
                 "notAfter": "Aug 21 12:00:00 2030 GMT"}
-        trusted = supervisor._certificate_summary(cert, "mcp.riseshield.ru", True)
-        untrusted = supervisor._certificate_summary(cert, "mcp.riseshield.ru", False,
+        trusted = supervisor._certificate_summary(cert, "mcp.example.com", True)
+        untrusted = supervisor._certificate_summary(cert, "mcp.example.com", False,
                                                     verification_error="unknown CA")
         self.assertTrue(trusted["ok"])
         self.assertEqual(trusted["issuer"], "Let's Encrypt")

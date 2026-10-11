@@ -84,7 +84,7 @@ export function mountStudio(host, { getState, refresh }) {
 					badge(authLabel(service.authMode), service.authMode === "oauth" ? "info" : service.authMode === "none" ? "warn" : "off"),
 				])),
 				el("button.studio-service.studio-service-manual" + (memory.selectedId === "__manual__" ? ".active" : ""), { type: "button", onclick: () => choose("__manual__", "tools") }, [
-					el("span.studio-manual-icon", { text: "URL", "aria-hidden": "true" }), el("span.studio-service-copy", null, [el("strong", { text: "Произвольный адрес" }), el("small", { text: "Например mcp.riseshield.ru/roblox" })]),
+					el("span.studio-manual-icon", { text: "URL", "aria-hidden": "true" }), el("span.studio-service-copy", null, [el("strong", { text: "Произвольный адрес" }), el("small", { text: "Например mcp.example.com/roblox" })]),
 				]),
 			]),
 		])
@@ -256,7 +256,7 @@ export function mountStudio(host, { getState, refresh }) {
 		if (memory.connectionService !== (selected?.id || "__manual__") || !memory.connection) {
 			memory.connectionService = selected?.id || "__manual__"
 			memory.connection = {
-				url: selected?.url || "https://mcp.riseshield.ru/roblox", authMode: selected ? "auto" : "none",
+				url: selected?.url || "https://mcp.example.com/roblox", authMode: selected ? "auto" : "none",
 				directUpstream: false, token: "", tokenUrl: "", clientId: "", clientSecret: "",
 				scope: "", audience: "", verifyTls: true, timeout: 25,
 			}
@@ -278,7 +278,7 @@ export function mountStudio(host, { getState, refresh }) {
 		form.append(
 			el("div.studio-section-title", null, [el("div", null, [el("h2", { text: "Подключение к MCP" }), el("p.muted", { text: "Tools загружаются только у выбранного адреса." })]), memory.meta ? badge(memory.meta.count + " tools", "ok") : null]),
 			el("div.form-grid", null, [
-				field("MCP endpoint", input("connectionUrl", c.url, { type: "url", required: !selected, placeholder: "https://mcp.riseshield.ru/roblox" }), "Можно вставить полный URL конкретного MCP"),
+				field("MCP endpoint", input("connectionUrl", c.url, { type: "url", required: !selected, placeholder: "https://mcp.example.com/roblox" }), "Можно вставить полный URL конкретного MCP"),
 				field("Авторизация", authMode),
 				field("Таймаут, секунд", input("connectionTimeout", c.timeout, { type: "number", min: 3, max: 120 })),
 			]),
