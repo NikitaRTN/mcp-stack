@@ -33,7 +33,8 @@ class ConfigTests(unittest.TestCase):
     def test_desktop_commander_uses_fixed_local_gateway(self):
         service = next(s for s in config.DEFAULT_SERVICES if s["id"] == "dc")
         command = config.expand_command(service)
-        self.assertIn("tools\\supergateway-fixed\\supergateway\\dist\\index.js", command)
+        self.assertIn("tools/supergateway-fixed/supergateway/dist/index.js",
+                      command.replace("\\", "/"))
         self.assertIn("--sessionTimeout 300000", command)
         self.assertIn("--logLevel none", command)
         gateway = config.ROOT / "tools" / "supergateway-fixed" / "supergateway"
