@@ -8,6 +8,7 @@ pub mod managed;
 pub mod migration;
 pub mod oauth_client;
 pub mod oauth_introspection;
+pub mod oauth_tokens;
 pub mod process;
 pub mod server;
 pub mod stdio;
