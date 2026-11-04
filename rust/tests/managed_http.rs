@@ -21,6 +21,11 @@ fn managed_service_helper() {
     let Ok(port) = std::env::var("MCP_TEST_MANAGED_PORT") else {
         return;
     };
+    if std::env::var_os("MCP_TEST_CHECK_TOKENS").is_some() {
+        assert!(std::env::var_os("MCP_HUB_TOKEN").is_none());
+        assert!(std::env::var_os("MCP_HUB_ADMIN_TOKEN").is_none());
+        assert!(std::env::var_os("MCP_HUB_UPSTREAM_TOKEN").is_none());
+    }
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -48,7 +53,7 @@ fn management_starts_proxies_and_stops_owned_service() {
             .unwrap()
             .as_nanos()
     ));
-    let config = json!({"services":[{"id":"default", "program":std::env::current_exe().unwrap(), "args":["--exact", "managed_service_helper", "--nocapture"], "env":{"MCP_TEST_MANAGED_PORT":port.to_string()}, "log":log}]});
+    let config = json!({"services":[{"id":"default", "program":std::env::current_exe().unwrap(), "args":["--exact", "managed_service_helper", "--nocapture"], "env":{"MCP_TEST_MANAGED_PORT":port.to_string(),"MCP_TEST_CHECK_TOKENS":"1"}, "log":log}]});
     let specs = managed::read_config(config.to_string().as_bytes()).unwrap();
     let mut proxy = Proxy::bind(Settings {
         port: 0,
@@ -169,7 +174,7 @@ fn executable_enables_explicit_management_config() {
     ));
     std::fs::create_dir(&dir).unwrap();
     let config = dir.join("processes.json");
-    let contents = json!({"services":[{"id":"default","program":std::env::current_exe().unwrap(),"args":["--exact","managed_service_helper","--nocapture"],"env":{"MCP_TEST_MANAGED_PORT":port.to_string()},"log":dir.join("service.log")}]}).to_string();
+    let contents = json!({"services":[{"id":"default","program":std::env::current_exe().unwrap(),"args":["--exact","managed_service_helper","--nocapture"],"env":{"MCP_TEST_MANAGED_PORT":port.to_string(),"MCP_TEST_CHECK_TOKENS":"1"},"log":dir.join("service.log")}]}).to_string();
     std::fs::write(&config, &contents).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_mcp-hub-rs"))
         .arg("serve")
@@ -178,7 +183,7 @@ fn executable_enables_explicit_management_config() {
         .env("MCP_HUB_ADMIN_TOKEN", ADMIN)
         .env("MCP_HUB_PROCESS_CONFIG", &config)
         .env("MCP_HUB_UPSTREAM", format!("http://127.0.0.1:{port}/mcp"))
-        .env_remove("MCP_HUB_UPSTREAM_TOKEN")
+        .env("MCP_HUB_UPSTREAM_TOKEN", "test-upstream-token-0123456789")
         .env_remove("MCP_HUB_CONFIG")
         .env_remove("MCP_HUB_DB")
         .stdout(Stdio::null())
@@ -360,7 +365,7 @@ fn sigterm_cleans_managed_service() {
     ));
     std::fs::create_dir(&dir).unwrap();
     let config = dir.join("processes.json");
-    std::fs::write(&config, json!({"services":[{"id":"default","program":std::env::current_exe().unwrap(),"args":["--exact","managed_service_helper","--nocapture"],"env":{"MCP_TEST_MANAGED_PORT":port.to_string()},"log":dir.join("log")}]}).to_string()).unwrap();
+    std::fs::write(&config, json!({"services":[{"id":"default","program":std::env::current_exe().unwrap(),"args":["--exact","managed_service_helper","--nocapture"],"env":{"MCP_TEST_MANAGED_PORT":port.to_string(),"MCP_TEST_CHECK_TOKENS":"1"},"log":dir.join("log")}]}).to_string()).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_mcp-hub-rs"))
         .arg("serve")
         .env("MCP_HUB_PORT", "0")
@@ -368,7 +373,7 @@ fn sigterm_cleans_managed_service() {
         .env("MCP_HUB_ADMIN_TOKEN", ADMIN)
         .env("MCP_HUB_PROCESS_CONFIG", &config)
         .env("MCP_HUB_UPSTREAM", format!("http://127.0.0.1:{port}/mcp"))
-        .env_remove("MCP_HUB_UPSTREAM_TOKEN")
+        .env("MCP_HUB_UPSTREAM_TOKEN", "test-upstream-token-0123456789")
         .env_remove("MCP_HUB_CONFIG")
         .env_remove("MCP_HUB_DB")
         .stdout(Stdio::null())
