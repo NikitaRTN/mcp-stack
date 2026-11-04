@@ -4,6 +4,7 @@ pub mod caddy;
 pub mod events;
 pub mod inspector;
 pub mod migration;
+pub mod telemetry;
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read};
