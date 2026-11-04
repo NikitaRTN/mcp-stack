@@ -447,3 +447,64 @@ fn executable_reads_legacy_fixture_without_writing_it() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), config);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn calls_a_tool_on_a_test_server_through_the_proxy() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (proxy, shutdown, join) = start(
+        format!("http://{addr}/mcp"),
+        Some(PathBuf::from(":memory:")),
+    );
+    let worker = thread::spawn(move || {
+        for index in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (head, body) = read_request(&mut stream);
+            let lower = head.to_ascii_lowercase();
+            assert!(lower.contains(&format!("authorization: bearer {UPSTREAM_TOKEN}\r\n")));
+            if index > 0 {
+                assert!(lower.contains("mcp-session-id: session-123\r\n"));
+            }
+            if index == 2 {
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["method"], "tools/call");
+                assert_eq!(request["params"]["name"], "echo");
+                assert_eq!(request["params"]["arguments"]["text"], "hello");
+            }
+            let payload = match index {
+                0 => json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26"}}).to_string(),
+                2 => json!({"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hello"}]}}).to_string(),
+                _ => String::new(),
+            };
+            let status = if index == 1 || index == 3 {
+                "202 Accepted"
+            } else {
+                "200 OK"
+            };
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nMcp-Session-Id: session-123\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).unwrap();
+        }
+    });
+    let mut client = Client::new(
+        &format!("http://{}/mcp", proxy.address()),
+        Some(TOKEN.into()),
+    )
+    .unwrap();
+    let result = client.call_tool("echo", json!({"text":"hello"})).unwrap();
+    assert_eq!(result["content"][0]["text"], "hello");
+    client.close();
+    worker.join().unwrap();
+    let store = proxy.telemetry().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let calls = store.list(Some("default"), 10).unwrap();
+        if calls
+            .iter()
+            .any(|c| c.tool.as_deref() == Some("echo") && c.status == "ok")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    stop(shutdown, join);
+}
