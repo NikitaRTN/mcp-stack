@@ -9,13 +9,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@1.92.0
         with:
           components: rustfmt, clippy
@@ -36,7 +36,7 @@ jobs:
       - name: Linux executable smoke test
         if: runner.os == 'Linux'
         run: ./target/release/mcp-hub-rs --version
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: mcp-hub-rs-experimental-${{ matrix.os }}
           path: |
@@ -44,9 +44,9 @@ jobs:
             rust/target/release/mcp-hub-rs.exe
           if-no-files-found: error
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Build Linux container
         run: docker build -f rust/Dockerfile -t mcp-hub-rs-experimental .
       - name: Smoke test container
