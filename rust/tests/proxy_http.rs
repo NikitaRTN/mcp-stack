@@ -154,6 +154,14 @@ fn rejects_untrusted_configuration() {
     assert!(Proxy::bind(settings("http://example.com/mcp", TOKEN)).is_err());
     assert!(Proxy::bind(settings("http://secret@localhost/mcp", TOKEN)).is_err());
     assert!(Proxy::bind(settings("http://localhost/mcp", "short")).is_err());
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut self_route = settings(&format!("http://127.0.0.1:{port}/mcp"), TOKEN);
+    self_route.port = port;
+    assert!(Proxy::bind(self_route).is_err());
 }
 
 #[test]

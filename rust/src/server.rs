@@ -177,6 +177,12 @@ impl Proxy {
             .server_addr()
             .to_ip()
             .ok_or("invalid server address")?;
+        if routes.values().any(|route| {
+            route.upstream.host_str().is_some_and(loopback_host)
+                && route.upstream.port_or_known_default() == Some(address.port())
+        }) {
+            return Err("upstream points to proxy listener".into());
+        }
         let agent = ureq::AgentBuilder::new()
             .redirects(0)
             .timeout_connect(Duration::from_secs(5))
