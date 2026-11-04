@@ -37,7 +37,7 @@ jobs:
           curl --fail --silent --show-error --location --retry 3 "$base/caddy_2.11.4_checksums.txt" -o checksums.txt
           expected=$(grep ' caddy_2.11.4_linux_amd64.tar.gz$' checksums.txt | awk '{print $1}')
           test -n "$expected"
-          echo "$expected  caddy.tar.gz" | sha256sum --check --status
+          echo "$expected  caddy.tar.gz" | sha512sum --check --status
           tar -xzf caddy.tar.gz caddy
           echo "CADDY_TEST_BIN=$RUNNER_TEMP/caddy/caddy" >> "$GITHUB_ENV"
       - name: Tests
