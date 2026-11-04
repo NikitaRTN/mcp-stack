@@ -1,7 +1,7 @@
-//! Experimental direct-child process management, not yet integrated with the Hub.
-//! Only direct children started by this instance are managed; it does not adopt
-//! processes or kill process trees. Do not use this as a production supervisor.
+//! Experimental owned process management, not yet integrated with the Hub.
+//! It never adopts or kills an arbitrary persisted PID. Not a production supervisor.
 use crate::events::EventBus;
+use crate::tree::ProcessTree;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -23,6 +23,7 @@ pub struct ProcessSpec {
 struct Managed {
     spec: ProcessSpec,
     child: Child,
+    tree: ProcessTree,
     started: f64,
 }
 
@@ -72,12 +73,7 @@ impl ProcessManager {
             .lock()
             .map_err(|_| "process manager unavailable")?;
         if let Some(existing) = children.get_mut(name) {
-            if existing
-                .child
-                .try_wait()
-                .map_err(|_| "cannot inspect process")?
-                .is_none()
-            {
+            if existing.tree.poll(&mut existing.child)?.is_none() {
                 if existing.spec != spec {
                     return Err("process configuration changed; stop before starting");
                 }
@@ -93,6 +89,9 @@ impl ProcessManager {
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
+            .env_remove("MCP_HUB_TOKEN")
+            .env_remove("MCP_HUB_ADMIN_TOKEN")
+            .env_remove("MCP_HUB_UPSTREAM_TOKEN")
             .envs(&spec.env)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
@@ -100,12 +99,14 @@ impl ProcessManager {
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let tree = ProcessTree::new()?;
+        tree.configure(&mut command);
+        let mut child = command.spawn().map_err(|_| "cannot start process")?;
+        if let Err(error) = tree.attach(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
-        let child = command.spawn().map_err(|_| "cannot start process")?;
         let pid = child.id();
         let started = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -116,6 +117,7 @@ impl ProcessManager {
             Managed {
                 spec,
                 child,
+                tree,
                 started,
             },
         );
@@ -137,12 +139,7 @@ impl ProcessManager {
         let Some(entry) = children.get_mut(name) else {
             return Ok(None);
         };
-        if entry
-            .child
-            .try_wait()
-            .map_err(|_| "cannot inspect process")?
-            .is_some()
-        {
+        if entry.tree.poll(&mut entry.child)?.is_some() {
             children.remove(name);
             return Ok(None);
         }
@@ -152,7 +149,7 @@ impl ProcessManager {
         }))
     }
 
-    /// Only the direct child is terminated, never an arbitrary or persisted PID.
+    /// Terminates an owned Windows job or Unix process group, never a persisted PID.
     pub fn stop(&self, name: &str) -> Result<bool, &'static str> {
         let mut children = self
             .children
@@ -161,23 +158,13 @@ impl ProcessManager {
         let Some(entry) = children.get_mut(name) else {
             return Ok(false);
         };
-        if entry
-            .child
-            .try_wait()
-            .map_err(|_| "cannot inspect process")?
-            .is_some()
-        {
+        if entry.tree.poll(&mut entry.child)?.is_some() {
             children.remove(name);
             return Ok(false);
         }
-        if entry.child.kill().is_err() {
-            // It may have exited between the check and kill.
-            if entry
-                .child
-                .try_wait()
-                .map_err(|_| "cannot inspect process")?
-                .is_none()
-            {
+        if entry.tree.terminate(&entry.child).is_err() {
+            // It may have exited between the check and termination.
+            if entry.tree.poll(&mut entry.child)?.is_none() {
                 return Err("cannot stop process");
             }
             children.remove(name);
@@ -195,13 +182,19 @@ impl ProcessManager {
 
 impl Drop for ProcessManager {
     fn drop(&mut self) {
-        // Best effort: dropping the manager must not leave its direct children behind.
+        // Best effort; Windows job handles also kill associated children on close.
         let children = self.children.get_mut().unwrap_or_else(|e| e.into_inner());
-        for (_, entry) in children.iter_mut() {
-            if entry.child.kill().is_ok() {
-                let _ = entry.child.wait();
-            } else {
-                let _ = entry.child.try_wait();
+        for entry in children.values_mut() {
+            match entry.tree.poll(&mut entry.child) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if entry.tree.terminate(&entry.child).is_ok() || entry.child.kill().is_ok() {
+                        let _ = entry.child.wait();
+                    }
+                }
+                Err(_) => {
+                    let _ = entry.child.kill();
+                }
             }
         }
     }
@@ -214,10 +207,12 @@ mod tests {
 
     #[test]
     fn child_helper() {
-        if std::env::var_os("MCP_HUB_CHILD_HELPER").is_some()
-            && std::env::var_os("MCP_HUB_CHILD_EXIT").is_none()
-        {
-            std::thread::sleep(Duration::from_secs(30));
+        if std::env::var_os("MCP_HUB_CHILD_HELPER").is_some() {
+            if std::env::var_os("MCP_HUB_CHILD_EXIT").is_none() {
+                std::thread::sleep(Duration::from_secs(30));
+            } else {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
     fn spec(exit: bool) -> ProcessSpec {
@@ -285,5 +280,126 @@ mod tests {
     fn rejects_invalid_names_without_spawning() {
         let manager = ProcessManager::new(EventBus::default());
         assert!(manager.start("../bad", spec(false)).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes)] // parent-exit deliberately orphans its test child
+    fn tree_child_helper() {
+        use std::io::Write;
+        let Ok(role) = std::env::var("MCP_HUB_TREE_ROLE") else {
+            return;
+        };
+        let activity = std::env::var_os("MCP_HUB_TREE_ACTIVITY").unwrap();
+        if role == "leaf" {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(activity)
+                .unwrap();
+            for _ in 0..500 {
+                file.write_all(b"x").unwrap();
+                file.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        } else if role == "parent" || role == "parent-exit" {
+            let gate = PathBuf::from(std::env::var_os("MCP_HUB_TREE_GATE").unwrap());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !gate.exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::tree_child_helper",
+                    "--nocapture",
+                ])
+                .env("MCP_HUB_TREE_ROLE", "leaf")
+                .env("MCP_HUB_TREE_ACTIVITY", &activity)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            if role == "parent-exit" {
+                while std::fs::metadata(&activity).map(|m| m.len()).unwrap_or(0) < 3 {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(12));
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    fn check_tree_shutdown(mode: u8) {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp-tree-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let activity = dir.join("activity");
+        let gate = dir.join("gate");
+        let mut s = spec(false);
+        s.args = vec![
+            "--exact".into(),
+            "process::tests::tree_child_helper".into(),
+            "--nocapture".into(),
+        ];
+        s.env.insert(
+            "MCP_HUB_TREE_ROLE".into(),
+            if mode == 2 { "parent-exit" } else { "parent" }.into(),
+        );
+        s.env
+            .insert("MCP_HUB_TREE_GATE".into(), gate.as_os_str().into());
+        s.env
+            .insert("MCP_HUB_TREE_ACTIVITY".into(), activity.as_os_str().into());
+        s.log = dir.join("parent.log");
+        let manager = ProcessManager::new(EventBus::default());
+        manager.start("tree", s).unwrap();
+        std::fs::write(&gate, b"go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while std::fs::metadata(&activity).map(|m| m.len()).unwrap_or(0) < 3 {
+            assert!(Instant::now() < deadline, "grandchild did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if mode == 2 {
+            while manager.status("tree").unwrap().is_some() {
+                assert!(Instant::now() < deadline, "parent did not exit");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drop(manager);
+        } else if mode == 1 {
+            drop(manager);
+        } else {
+            assert!(manager.stop("tree").unwrap());
+            drop(manager);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let size = std::fs::metadata(&activity).unwrap().len();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            std::fs::metadata(&activity).unwrap().len(),
+            size,
+            "grandchild survived shutdown"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn stop_terminates_spawned_tree() {
+        check_tree_shutdown(0);
+    }
+    #[test]
+    fn drop_terminates_spawned_tree() {
+        check_tree_shutdown(1);
+    }
+    #[test]
+    #[cfg(any(windows, target_os = "linux"))]
+    fn natural_parent_exit_terminates_spawned_tree() {
+        check_tree_shutdown(2);
     }
 }

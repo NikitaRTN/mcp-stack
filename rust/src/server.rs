@@ -1,6 +1,7 @@
 //! Experimental loopback-only authenticated MCP proxy, not the legacy Hub.
 use crate::events::EventBus;
 use crate::inspector::{self, Outcome, SseScanner};
+use crate::process::{ProcessManager, ProcessSpec};
 use crate::telemetry::{CallStart, TelemetryStore};
 use ring::{hmac, rand::SystemRandom};
 use serde_json::Value;
@@ -34,7 +35,14 @@ struct Route {
     upstream: Url,
     upstream_token: Option<String>,
 }
+struct Management {
+    key: hmac::Key,
+    digest: hmac::Tag,
+    specs: HashMap<String, ProcessSpec>,
+    processes: ProcessManager,
+}
 pub struct Proxy {
+    management: Option<Management>,
     server: Arc<Server>,
     address: SocketAddr,
     agent: ureq::Agent,
@@ -58,6 +66,8 @@ fn valid_id(id: &str) -> bool {
 }
 fn valid_path(path: &str) -> bool {
     path.starts_with('/')
+        && path != "/_hub"
+        && !path.starts_with("/_hub/")
         && path.len() > 1
         && path.len() <= 128
         && path
@@ -173,6 +183,7 @@ impl Proxy {
             .timeout_read(Duration::from_secs(60))
             .build();
         Ok(Self {
+            management: None,
             server: Arc::new(server),
             address,
             agent,
@@ -181,6 +192,42 @@ impl Proxy {
             auth_digest,
             telemetry,
         })
+    }
+    /// Explicit opt-in. The management credential must differ from the proxy credential.
+    pub fn enable_management(
+        &mut self,
+        token: String,
+        specs: HashMap<String, ProcessSpec>,
+    ) -> Result<(), String> {
+        if self.management.is_some()
+            || !valid_token(&token)
+            || hmac::verify(
+                &self.auth_key,
+                format!("Bearer {token}").as_bytes(),
+                self.auth_digest.as_ref(),
+            )
+            .is_ok()
+        {
+            return Err("invalid or duplicate management configuration".into());
+        }
+        if specs.is_empty()
+            || specs.len() > 100
+            || specs
+                .keys()
+                .any(|id| !valid_id(id) || !self.routes.values().any(|r| &r.id == id))
+        {
+            return Err("process IDs must match configured routes".into());
+        }
+        let key = hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new())
+            .map_err(|_| "random generator unavailable")?;
+        let digest = hmac::sign(&key, format!("Bearer {token}").as_bytes());
+        self.management = Some(Management {
+            key,
+            digest,
+            specs,
+            processes: ProcessManager::new(EventBus::default()),
+        });
+        Ok(())
     }
     pub fn address(&self) -> SocketAddr {
         self.address
@@ -208,6 +255,49 @@ impl Proxy {
         }
         Ok(())
     }
+    fn handle_management(&self, req: Request, authorization: &str) {
+        let Some(m) = &self.management else {
+            return reply(req, 404, "not found");
+        };
+        if hmac::verify(&m.key, authorization.as_bytes(), m.digest.as_ref()).is_err() {
+            return reply(req, 401, "unauthorized");
+        }
+        if !matches!(header(&req, "Transfer-Encoding"), Ok(None))
+            || req.body_length().unwrap_or(0) != 0
+        {
+            return reply(req, 400, "request body not supported");
+        }
+        let Some(id) = req.url().strip_prefix("/_hub/services/") else {
+            return reply(req, 404, "not found");
+        };
+        let Some(spec) = m.specs.get(id) else {
+            return reply(req, 404, "not found");
+        };
+        let result = match req.method() {
+            Method::Get => m
+                .processes
+                .status(id)
+                .map(|s| serde_json::json!({"running": s.is_some(), "pid": s.map(|s| s.pid)})),
+            Method::Post => m
+                .processes
+                .start(id, spec.clone())
+                .map(|s| serde_json::json!({"running": true, "pid": s.pid})),
+            Method::Delete => m
+                .processes
+                .stop(id)
+                .map(|stopped| serde_json::json!({"running": false, "stopped": stopped})),
+            _ => return reply(req, 405, "method not allowed"),
+        };
+        match result {
+            Ok(value) => {
+                let response = Response::from_string(value.to_string())
+                    .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
+                    .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+                let _ = req.respond(response);
+            }
+            Err(_) => reply(req, 500, "process operation failed"),
+        }
+    }
     fn handle(&self, mut req: Request) {
         let host = match header(&req, "Host") {
             Ok(Some(v)) => v,
@@ -232,6 +322,9 @@ impl Proxy {
             Ok(Some(v)) => v,
             _ => return reply(req, 401, "unauthorized"),
         };
+        if req.url().starts_with("/_hub/") || req.url() == "/_hub" {
+            return self.handle_management(req, &authorization);
+        }
         if hmac::verify(
             &self.auth_key,
             authorization.as_bytes(),

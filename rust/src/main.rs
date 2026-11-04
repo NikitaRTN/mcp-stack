@@ -49,7 +49,7 @@ fn serve() -> Result<(), String> {
         .parse::<u16>()
         .map_err(|_| "invalid MCP_HUB_PORT")?;
     let db = std::env::var_os("MCP_HUB_DB").map(Into::into);
-    let (proxy, suffix) = if let Some(path) = std::env::var_os("MCP_HUB_CONFIG") {
+    let (mut proxy, suffix) = if let Some(path) = std::env::var_os("MCP_HUB_CONFIG") {
         if std::env::var_os("MCP_HUB_UPSTREAM").is_some()
             || std::env::var_os("MCP_HUB_UPSTREAM_TOKEN").is_some()
         {
@@ -71,10 +71,29 @@ fn serve() -> Result<(), String> {
         };
         (Proxy::bind(settings)?, "/mcp")
     };
+    match (
+        std::env::var_os("MCP_HUB_PROCESS_CONFIG"),
+        std::env::var("MCP_HUB_ADMIN_TOKEN").ok(),
+    ) {
+        (Some(path), Some(admin_token)) => {
+            let file = std::fs::File::open(path).map_err(|_| "cannot open process config")?;
+            proxy.enable_management(admin_token, mcp_hub_rs::managed::read_config(file)?)?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "MCP_HUB_PROCESS_CONFIG and MCP_HUB_ADMIN_TOKEN must be set together".into(),
+            )
+        }
+    }
     let proxy = Arc::new(proxy);
     eprintln!(
         "Experimental MCP proxy listening at http://{}{suffix}",
         proxy.address()
     );
-    proxy.run(Arc::new(AtomicBool::new(false)))
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let signal = shutdown.clone();
+    ctrlc::set_handler(move || signal.store(true, std::sync::atomic::Ordering::Relaxed))
+        .map_err(|_| "cannot install shutdown handler")?;
+    proxy.run(shutdown)
 }

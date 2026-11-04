@@ -3,11 +3,13 @@ pub mod auth;
 pub mod caddy;
 pub mod events;
 pub mod inspector;
+pub mod managed;
 pub mod migration;
 pub mod process;
 pub mod server;
 pub mod telemetry;
 pub mod trace;
+mod tree;
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read};
