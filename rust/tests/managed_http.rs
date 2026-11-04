@@ -335,3 +335,82 @@ fn proxy_monitor_cleans_descendants_without_status_requests() {
     drop(proxy);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn sigterm_cleans_managed_service() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    let dir = std::env::temp_dir().join(format!(
+        "mcp-term-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let config = dir.join("processes.json");
+    std::fs::write(&config, json!({"services":[{"id":"default","program":std::env::current_exe().unwrap(),"args":["--exact","managed_service_helper","--nocapture"],"env":{"MCP_TEST_MANAGED_PORT":port.to_string()},"log":dir.join("log")}]}).to_string()).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_mcp-hub-rs"))
+        .arg("serve")
+        .env("MCP_HUB_PORT", "0")
+        .env("MCP_HUB_TOKEN", TOKEN)
+        .env("MCP_HUB_ADMIN_TOKEN", ADMIN)
+        .env("MCP_HUB_PROCESS_CONFIG", &config)
+        .env("MCP_HUB_UPSTREAM", format!("http://127.0.0.1:{port}/mcp"))
+        .env_remove("MCP_HUB_UPSTREAM_TOKEN")
+        .env_remove("MCP_HUB_CONFIG")
+        .env_remove("MCP_HUB_DB")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut guard = Guard(child);
+    let mut line = String::new();
+    BufReader::new(guard.0.stderr.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let base = line
+        .trim()
+        .split_once(" at ")
+        .unwrap()
+        .1
+        .trim_end_matches("/mcp");
+    drop(reserved);
+    ureq::post(&format!("{base}/_hub/services/default"))
+        .set("Authorization", &format!("Bearer {ADMIN}"))
+        .send_string("")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: PID is the running child owned by this test and has not been reaped.
+    assert_eq!(unsafe { libc::kill(guard.0.id() as i32, libc::SIGTERM) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        if let Some(status) = guard.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "server did not shut down");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success());
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "managed service survived shutdown"
+    );
+    drop(guard);
+    std::fs::remove_dir_all(dir).unwrap();
+}
