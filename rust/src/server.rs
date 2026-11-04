@@ -47,6 +47,7 @@ struct Management {
 pub struct Proxy {
     stdio_streams: Arc<AtomicUsize>,
     management: Option<Management>,
+    builtin: Option<crate::oauth_builtin_http::Builtin>,
     server: Arc<Server>,
     address: SocketAddr,
     agent: ureq::Agent,
@@ -91,7 +92,7 @@ fn header(req: &Request, name: &'static str) -> Result<Option<String>, ()> {
     }
     Ok(found)
 }
-fn oauth_denied(req: Request, code: u16, challenge: &'static str) {
+fn oauth_denied(req: Request, code: u16, challenge: &str) {
     let _ = req.respond(
         Response::from_string("OAuth access denied")
             .with_status_code(code)
@@ -248,6 +249,7 @@ impl Proxy {
         Ok(Self {
             stdio_streams,
             management: None,
+            builtin: None,
             server: Arc::new(server),
             address,
             agent,
@@ -275,18 +277,55 @@ impl Proxy {
         route.upstream = None;
         Ok(())
     }
+    /// Experimental built-in OAuth for a single explicitly selected loopback route.
+    pub fn enable_builtin_oauth(
+        &mut self,
+        id: &str,
+        mut config: crate::oauth_builtin_http::Config,
+    ) -> Result<(), String> {
+        if self.builtin.is_some()
+            || self.routes.keys().any(|p| {
+                p == "/oauth"
+                    || p.starts_with("/oauth/")
+                    || p == "/.well-known"
+                    || p.starts_with("/.well-known/")
+            })
+        {
+            return Err("OAuth routes conflict or are already configured".into());
+        }
+        let (path, route) = self
+            .routes
+            .iter()
+            .find(|(_, r)| r.id == id)
+            .ok_or("unknown OAuth route")?;
+        if route.inbound_oauth.is_some() {
+            return Err("route already has inbound OAuth".into());
+        }
+        let base_local = format!("http://localhost:{}", self.address.port());
+        let base_ip = format!("http://127.0.0.1:{}", self.address.port());
+        if config.base != base_local && config.base != base_ip {
+            return Err("OAuth base must match the loopback listener".into());
+        }
+        config.path = path.clone();
+        self.builtin = Some(crate::oauth_builtin_http::Builtin::new(config)?);
+        Ok(())
+    }
     /// Replace static bearer access on one route with external introspection; never a fallback.
     pub fn enable_inbound_oauth(
         &mut self,
         id: &str,
         settings: crate::oauth_introspection::Settings,
     ) -> Result<(), String> {
+        let builtin_id = self
+            .builtin
+            .as_ref()
+            .is_some_and(|b| self.routes.get(b.path()).is_some_and(|r| r.id == id));
         let route = self
             .routes
             .values_mut()
             .find(|r| r.id == id)
             .ok_or("unknown inbound OAuth route")?;
-        if route.inbound_oauth.is_some() {
+        if route.inbound_oauth.is_some() || builtin_id {
             return Err("inbound OAuth already configured".into());
         }
         route.inbound_oauth = Some(crate::oauth_introspection::Introspection::new(settings)?);
@@ -468,8 +507,17 @@ impl Proxy {
             Err(_) => return reply(req, 400, "invalid origin"),
             _ => {}
         }
+        let route_path = req.url().split('?').next().unwrap_or("");
+        if let Some(builtin) = &self.builtin {
+            if builtin.handles(route_path) {
+                return builtin.handle(req);
+            }
+        }
         let authorization = match header(&req, "Authorization") {
             Ok(Some(v)) => v,
+            _ if self.builtin.as_ref().is_some_and(|b| b.path() == req.url()) => {
+                return oauth_denied(req, 401, &self.builtin.as_ref().unwrap().challenge(None));
+            }
             _ if self
                 .routes
                 .get(req.url())
@@ -482,7 +530,15 @@ impl Proxy {
         if req.url().starts_with("/_hub/") || req.url() == "/_hub" {
             return self.handle_management(req, &authorization);
         }
-        if let Some(oauth) = self
+        if let Some(builtin) = self.builtin.as_ref().filter(|b| b.path() == req.url()) {
+            if let Err(error) = builtin.validate(&authorization) {
+                let (status, error) = match error {
+                    crate::oauth_core::Error::InvalidScope => (403, "insufficient_scope"),
+                    _ => (401, "invalid_token"),
+                };
+                return oauth_denied(req, status, &builtin.challenge(Some(error)));
+            }
+        } else if let Some(oauth) = self
             .routes
             .get(req.url())
             .and_then(|r| r.inbound_oauth.as_ref())

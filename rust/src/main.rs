@@ -154,6 +154,59 @@ fn serve() -> Result<(), String> {
             std::env::var("MCP_HUB_INTROSPECTION_ROUTE").unwrap_or_else(|_| "default".into());
         proxy.enable_inbound_oauth(&route, settings)?;
     }
+    let builtin_file = std::env::var_os("MCP_HUB_BUILTIN_CONFIG");
+    let builtin_key = std::env::var("MCP_HUB_BUILTIN_SIGNING_KEY").ok();
+    match (builtin_file, builtin_key) {
+        (Some(path), Some(key)) => {
+            use std::io::Read;
+            if key.len() < 32 || key.len() > 4096 {
+                return Err("invalid built-in OAuth signing key".into());
+            }
+            let file =
+                std::fs::File::open(path).map_err(|_| "cannot open built-in OAuth config")?;
+            let mut bytes = Vec::new();
+            file.take(100_001)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "cannot read built-in OAuth config")?;
+            if bytes.len() > 100_000 {
+                return Err("built-in OAuth config too large".into());
+            }
+            let v: Value =
+                serde_json::from_slice(&bytes).map_err(|_| "invalid built-in OAuth config")?;
+            let text = |name| {
+                v.get(name)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or("incomplete built-in OAuth config")
+            };
+            let scopes: Vec<String> = serde_json::from_value(
+                v.get("scopes")
+                    .cloned()
+                    .ok_or("incomplete built-in OAuth config")?,
+            )
+            .map_err(|_| "invalid OAuth scopes")?;
+            let config = mcp_hub_rs::oauth_builtin_http::Config {
+                database: text("database")?.into(),
+                signing_key: key,
+                auth: v
+                    .get("auth")
+                    .cloned()
+                    .ok_or("incomplete built-in OAuth config")?,
+                base: text("base")?,
+                path: String::new(),
+                scopes,
+            };
+            let route = v.get("route").and_then(Value::as_str).unwrap_or("default");
+            proxy.enable_builtin_oauth(route, config)?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "MCP_HUB_BUILTIN_CONFIG and MCP_HUB_BUILTIN_SIGNING_KEY must be set together"
+                    .into(),
+            )
+        }
+    }
     match (
         std::env::var_os("MCP_HUB_PROCESS_CONFIG"),
         std::env::var("MCP_HUB_ADMIN_TOKEN").ok(),
