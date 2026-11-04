@@ -139,6 +139,10 @@ impl TelemetryStore {
             return Err("invalid call status".into());
         }
         let bytes = i64::try_from(response_bytes).map_err(|_| "invalid byte count")?;
+        let measured_duration = trace
+            .and_then(|value| value.get("total_ms"))
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n >= 0.0);
         let trace = trace
             .map(|v| serde_json::to_string(v).map_err(|_| "invalid trace"))
             .transpose()?;
@@ -148,8 +152,8 @@ impl TelemetryStore {
         let finished = now();
         let changed = {
             let conn = self.conn.lock().map_err(|_| "telemetry unavailable")?;
-            conn.execute("UPDATE calls SET finished=?, duration_ms=MAX(0,(?-started)*1000),status=?,error=?,resp_bytes=?,trace=? WHERE id=? AND status='running'",
-                params![finished,finished,status,error.map(|v|trim(v,2000)),bytes,trace,id]).map_err(|_| "cannot finish call")?
+            conn.execute("UPDATE calls SET finished=?, duration_ms=COALESCE(?,MAX(0,(?-started)*1000)),status=?,error=?,resp_bytes=?,trace=? WHERE id=? AND status='running'",
+                params![finished,measured_duration,finished,status,error.map(|v|trim(v,2000)),bytes,trace,id]).map_err(|_| "cannot finish call")?
         };
         if changed > 0 {
             let _ = self.bus.publish(
@@ -284,12 +288,18 @@ mod tests {
         let id = db.begin(start("alpha", &args)).unwrap();
         assert_eq!(db.get(id).unwrap().unwrap().status, "running");
         assert!(db
-            .finish(id, "ok", None, 22, Some(&json!({"version":1})))
+            .finish(
+                id,
+                "ok",
+                None,
+                22,
+                Some(&json!({"version":1,"total_ms":123.4}))
+            )
             .unwrap());
         assert!(!db.finish(id, "error", None, 0, None).unwrap());
         let row = db.get(id).unwrap().unwrap();
         assert_eq!(row.status, "ok");
-        assert!(row.duration_ms.unwrap() >= 0.0);
+        assert_eq!(row.duration_ms.unwrap(), 123.4);
         assert!(row.trace.unwrap().contains("version"));
         assert_eq!(db.list(Some("alpha"), 100).unwrap().len(), 1);
         assert!(db.list(Some("other"), 100).unwrap().is_empty());
