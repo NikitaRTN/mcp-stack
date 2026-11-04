@@ -1,0 +1,53 @@
+name: rust-experimental
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked --all-targets
+      - name: Release build
+        run: cargo build --locked --release
+      - name: Windows executable smoke test
+        if: runner.os == 'Windows'
+        run: ./target/release/mcp-hub-rs.exe --version
+      - name: Linux executable smoke test
+        if: runner.os == 'Linux'
+        run: ./target/release/mcp-hub-rs --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-hub-rs-experimental-${{ matrix.os }}
+          path: |
+            rust/target/release/mcp-hub-rs
+            rust/target/release/mcp-hub-rs.exe
+          if-no-files-found: error
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Linux container
+        run: docker build -f rust/Dockerfile -t mcp-hub-rs-experimental .
+      - name: Smoke test container
+        run: docker run --rm mcp-hub-rs-experimental --version
