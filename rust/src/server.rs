@@ -4,6 +4,7 @@ use crate::inspector::{self, Outcome, SseScanner};
 use crate::telemetry::{CallStart, TelemetryStore};
 use ring::{hmac, rand::SystemRandom};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -22,12 +23,22 @@ pub struct Settings {
     /// Explicit separate DB; never automatically opens legacy data.
     pub telemetry_db: Option<PathBuf>,
 }
+pub struct RouteSpec {
+    pub id: String,
+    pub path: String,
+    pub upstream: String,
+    pub upstream_token: Option<String>,
+}
+struct Route {
+    id: String,
+    upstream: Url,
+    upstream_token: Option<String>,
+}
 pub struct Proxy {
     server: Arc<Server>,
     address: SocketAddr,
     agent: ureq::Agent,
-    upstream: Url,
-    upstream_token: Option<String>,
+    routes: HashMap<String, Route>,
     auth_key: hmac::Key,
     auth_digest: hmac::Tag,
     telemetry: Option<Arc<TelemetryStore>>,
@@ -37,6 +48,22 @@ fn valid_token(value: &str) -> bool {
 }
 fn loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|v| v.is_loopback())
+}
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+}
+fn valid_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() > 1
+        && path.len() <= 128
+        && path
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"/._~-".contains(&c))
+        && !path.split('/').any(|p| p == "." || p == "..")
 }
 fn header(req: &Request, name: &'static str) -> Result<Option<String>, ()> {
     let mut found = None;
@@ -60,38 +87,81 @@ fn reply(req: Request, status: u16, message: &'static str) {
 }
 impl Proxy {
     pub fn bind(settings: Settings) -> Result<Self, String> {
-        if !valid_token(&settings.access_token) {
+        let route = RouteSpec {
+            id: "default".into(),
+            path: "/mcp".into(),
+            upstream: settings.upstream,
+            upstream_token: settings.upstream_token,
+        };
+        Self::bind_routes(
+            settings.port,
+            settings.access_token,
+            vec![route],
+            settings.telemetry_db,
+        )
+    }
+    pub fn bind_routes(
+        port: u16,
+        access_token: String,
+        specs: Vec<RouteSpec>,
+        telemetry_db: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        if !valid_token(&access_token) {
             return Err("MCP_HUB_TOKEN must contain 24-1024 visible ASCII characters".into());
         }
-        if settings.upstream_token.as_ref().is_some_and(|v| {
-            v.is_empty() || v.len() > 1024 || !v.bytes().all(|c| (0x21..=0x7e).contains(&c))
-        }) {
-            return Err("invalid upstream token".into());
+        if specs.is_empty() || specs.len() > 100 {
+            return Err("invalid number of routes".into());
         }
-        let upstream = Url::parse(&settings.upstream).map_err(|_| "invalid upstream URL")?;
-        if !matches!(upstream.scheme(), "http" | "https")
-            || upstream.host_str().is_none()
-            || !upstream.username().is_empty()
-            || upstream.password().is_some()
-            || upstream.fragment().is_some()
-        {
-            return Err("upstream must be an HTTP(S) URL without credentials or fragment".into());
-        }
-        if settings.upstream_token.is_some()
-            && upstream.scheme() != "https"
-            && !loopback_host(upstream.host_str().unwrap_or_default())
-        {
-            return Err("upstream bearer token requires HTTPS or loopback".into());
+        let mut routes = HashMap::new();
+        let mut ids = std::collections::HashSet::new();
+        for spec in specs {
+            if !valid_id(&spec.id) || !valid_path(&spec.path) || !ids.insert(spec.id.clone()) {
+                return Err("invalid or duplicate route identity".into());
+            }
+            if spec.upstream_token.as_ref().is_some_and(|v| {
+                v.is_empty() || v.len() > 1024 || !v.bytes().all(|c| (0x21..=0x7e).contains(&c))
+            }) {
+                return Err("invalid upstream token".into());
+            }
+            let upstream = Url::parse(&spec.upstream).map_err(|_| "invalid upstream URL")?;
+            if !matches!(upstream.scheme(), "http" | "https")
+                || upstream.host_str().is_none()
+                || !upstream.username().is_empty()
+                || upstream.password().is_some()
+                || upstream.fragment().is_some()
+            {
+                return Err(
+                    "upstream must be an HTTP(S) URL without credentials or fragment".into(),
+                );
+            }
+            if spec.upstream_token.is_some()
+                && upstream.scheme() != "https"
+                && !loopback_host(upstream.host_str().unwrap_or_default())
+            {
+                return Err("upstream bearer token requires HTTPS or loopback".into());
+            }
+            if routes
+                .insert(
+                    spec.path,
+                    Route {
+                        id: spec.id,
+                        upstream,
+                        upstream_token: spec.upstream_token,
+                    },
+                )
+                .is_some()
+            {
+                return Err("duplicate route path".into());
+            }
         }
         let key = hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new())
             .map_err(|_| "random generator unavailable")?;
-        let auth_digest = hmac::sign(&key, format!("Bearer {}", settings.access_token).as_bytes());
-        let telemetry = settings
-            .telemetry_db
+        let auth_digest = hmac::sign(&key, format!("Bearer {access_token}").as_bytes());
+        let telemetry = telemetry_db
             .as_deref()
             .map(|path| TelemetryStore::open(path, EventBus::default()).map(Arc::new))
             .transpose()?;
-        let server = Server::http(SocketAddr::from((Ipv4Addr::LOCALHOST, settings.port)))
+        let server = Server::http(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
             .map_err(|_| "cannot bind loopback server")?;
         let address = server
             .server_addr()
@@ -106,8 +176,7 @@ impl Proxy {
             server: Arc::new(server),
             address,
             agent,
-            upstream,
-            upstream_token: settings.upstream_token,
+            routes,
             auth_key: key,
             auth_digest,
             telemetry,
@@ -172,9 +241,9 @@ impl Proxy {
         {
             return reply(req, 401, "unauthorized");
         }
-        if req.url() != "/mcp" {
+        let Some(route) = self.routes.get(req.url()) else {
             return reply(req, 404, "not found");
-        }
+        };
         let method = match req.method() {
             Method::Post => "POST",
             Method::Get => "GET",
@@ -235,7 +304,7 @@ impl Proxy {
                     .and_then(Value::as_str)
                     .filter(|_| method == "tools/call");
                 if let Ok(row) = store.begin(CallStart {
-                    service: "default",
+                    service: &route.id,
                     method,
                     tool,
                     rpc_id: id_text.as_deref(),
@@ -248,11 +317,11 @@ impl Proxy {
                 }
             }
         }
-        let mut upstream = self.agent.request(method, self.upstream.as_str());
+        let mut upstream = self.agent.request(method, route.upstream.as_str());
         for (name, value) in &forwarded {
             upstream = upstream.set(name, value);
         }
-        if let Some(token) = &self.upstream_token {
+        if let Some(token) = &route.upstream_token {
             upstream = upstream.set("Authorization", &format!("Bearer {token}"));
         }
         let response = if method == "POST" {
@@ -474,4 +543,107 @@ fn send_sse<R: Read, W: Write>(
     }
     writer.write_all(b"0\r\n\r\n")?;
     writer.flush()
+}
+
+/// Convert an explicitly supplied legacy config into local-only routes without modifying it.
+/// Unsupported authentication fails closed; this does not start stdio services.
+pub fn legacy_routes(reader: impl Read) -> Result<(String, Vec<RouteSpec>), String> {
+    let config = crate::migration::ImportCandidate::read(reader)
+        .map_err(str::to_owned)?
+        .into_value();
+    let token = config
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or("missing legacy token")?
+        .to_owned();
+    let services = config
+        .get("services")
+        .and_then(Value::as_array)
+        .ok_or("missing legacy services")?;
+    let mut routes = Vec::new();
+    for service in services {
+        if service.get("enabled").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let get = |key: &str| -> Result<Option<&str>, String> {
+            match service.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(value)) => Ok(Some(value)),
+                _ => Err("invalid legacy service field".into()),
+            }
+        };
+        if get("authMode")?
+            .filter(|v| !v.is_empty())
+            .unwrap_or("token")
+            != "token"
+        {
+            return Err("legacy service authentication is not supported yet".into());
+        }
+        let id = get("id")?.ok_or("missing service id")?.to_owned();
+        let path = get("path")?.ok_or("missing service path")?.to_owned();
+        let kind = get("kind")?.unwrap_or("remote");
+        let (upstream, upstream_token) = match kind {
+            "stdio" => {
+                let port = service
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u16::try_from(n).ok())
+                    .filter(|n| *n > 0)
+                    .ok_or("invalid stdio service port")?;
+                let path = get("upstreamPath")?
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("/mcp");
+                if !path.starts_with('/') || path.contains(['\r', '\n', '#']) {
+                    return Err("invalid upstream path".into());
+                }
+                (format!("http://127.0.0.1:{port}{path}"), None)
+            }
+            "remote" => {
+                let raw = get("upstream")?
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("missing remote upstream")?
+                    .trim();
+                let mut upstream = if raw.contains("://") {
+                    raw.to_owned()
+                } else {
+                    format!("http://{raw}")
+                };
+                let authority = upstream
+                    .split_once("://")
+                    .map(|(_, rest)| rest)
+                    .unwrap_or("");
+                if !authority
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or("")
+                    .contains('/')
+                {
+                    let mut url = Url::parse(&upstream).map_err(|_| "invalid upstream URL")?;
+                    url.set_path("/mcp");
+                    upstream = url.to_string();
+                }
+                let secret = get("upstreamToken")?.filter(|s| !s.is_empty());
+                let mode = get("upstreamAuthMode")?
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or(if secret.is_some() { "bearer" } else { "none" });
+                let token = match mode {
+                    "none" => None,
+                    "bearer" => Some(secret.ok_or("missing upstream bearer token")?.to_owned()),
+                    _ => return Err("legacy upstream authentication is not supported yet".into()),
+                };
+                (upstream, token)
+            }
+            _ => return Err("legacy service kind is not supported".into()),
+        };
+        routes.push(RouteSpec {
+            id,
+            path,
+            upstream,
+            upstream_token,
+        });
+    }
+    if routes.is_empty() {
+        return Err("no supported enabled legacy services".into());
+    }
+    Ok((token, routes))
 }

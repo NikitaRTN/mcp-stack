@@ -48,16 +48,32 @@ fn serve() -> Result<(), String> {
         .unwrap_or_else(|_| "8765".into())
         .parse::<u16>()
         .map_err(|_| "invalid MCP_HUB_PORT")?;
-    let settings = Settings {
-        port,
-        upstream: std::env::var("MCP_HUB_UPSTREAM").map_err(|_| "MCP_HUB_UPSTREAM is required")?,
-        access_token: std::env::var("MCP_HUB_TOKEN").map_err(|_| "MCP_HUB_TOKEN is required")?,
-        upstream_token: std::env::var("MCP_HUB_UPSTREAM_TOKEN").ok(),
-        telemetry_db: std::env::var_os("MCP_HUB_DB").map(Into::into),
+    let db = std::env::var_os("MCP_HUB_DB").map(Into::into);
+    let (proxy, suffix) = if let Some(path) = std::env::var_os("MCP_HUB_CONFIG") {
+        if std::env::var_os("MCP_HUB_UPSTREAM").is_some()
+            || std::env::var_os("MCP_HUB_UPSTREAM_TOKEN").is_some()
+        {
+            return Err("MCP_HUB_CONFIG cannot be combined with upstream overrides".into());
+        }
+        let file = std::fs::File::open(path).map_err(|_| "cannot open legacy config")?;
+        let (legacy_token, routes) = mcp_hub_rs::server::legacy_routes(file)?;
+        let token = std::env::var("MCP_HUB_TOKEN").unwrap_or(legacy_token);
+        (Proxy::bind_routes(port, token, routes, db)?, "")
+    } else {
+        let settings = Settings {
+            port,
+            upstream: std::env::var("MCP_HUB_UPSTREAM")
+                .map_err(|_| "MCP_HUB_UPSTREAM is required")?,
+            access_token: std::env::var("MCP_HUB_TOKEN")
+                .map_err(|_| "MCP_HUB_TOKEN is required")?,
+            upstream_token: std::env::var("MCP_HUB_UPSTREAM_TOKEN").ok(),
+            telemetry_db: db,
+        };
+        (Proxy::bind(settings)?, "/mcp")
     };
-    let proxy = Arc::new(Proxy::bind(settings)?);
+    let proxy = Arc::new(proxy);
     eprintln!(
-        "Experimental MCP proxy listening at http://{}/mcp",
+        "Experimental MCP proxy listening at http://{}{suffix}",
         proxy.address()
     );
     proxy.run(Arc::new(AtomicBool::new(false)))

@@ -291,6 +291,7 @@ fn compiled_executable_serves_mcp_over_http() {
         .env("MCP_HUB_TOKEN", TOKEN)
         .env("MCP_HUB_UPSTREAM", format!("http://{upstream}/mcp"))
         .env_remove("MCP_HUB_UPSTREAM_TOKEN")
+        .env_remove("MCP_HUB_CONFIG")
         .env_remove("MCP_HUB_DB")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -311,4 +312,138 @@ fn compiled_executable_serves_mcp_over_http() {
         .unwrap();
     assert_eq!(value["id"], 7);
     worker.join().unwrap();
+}
+
+#[test]
+fn legacy_routes_reject_unsupported_auth_and_collisions() {
+    use mcp_hub_rs::server::legacy_routes;
+    let mut config = json!({"token": TOKEN, "services":[{"id":"a","path":"/a","kind":"remote",
+        "upstream":"http://127.0.0.1:9/mcp", "enabled":true, "authMode":"oauth"}]});
+    assert!(legacy_routes(config.to_string().as_bytes()).is_err());
+    config["services"][0]["authMode"] = json!("token");
+    config["services"][0]["upstreamAuthMode"] = json!("oauth");
+    assert!(legacy_routes(config.to_string().as_bytes()).is_err());
+    config["services"][0]["upstreamAuthMode"] = json!("none");
+    config["services"][0]["upstream"] = json!("127.0.0.1:9?foo=bar");
+    let (_, routes) = legacy_routes(config.to_string().as_bytes()).unwrap();
+    assert_eq!(routes[0].upstream, "http://127.0.0.1:9/mcp?foo=bar");
+    config["services"].as_array_mut().unwrap().push(json!({"id":"b","path":"/a","kind":"remote", "upstream":"http://127.0.0.1:9/mcp", "enabled":true}));
+    let (token, routes) = legacy_routes(config.to_string().as_bytes()).unwrap();
+    assert!(Proxy::bind_routes(0, token, routes, None).is_err());
+}
+
+#[test]
+fn routes_multiple_legacy_services_without_modifying_config() {
+    use mcp_hub_rs::server::legacy_routes;
+    let a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (addr_a, addr_b) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+    let config = json!({"token":TOKEN, "services":[
+        {"id":"remote", "path":"/remote", "kind":"remote", "upstream":format!("http://{addr_a}/mcp"), "enabled":true},
+        {"id":"local", "path":"/local", "kind":"stdio", "port":addr_b.port(), "upstreamPath":"/mcp", "enabled":true},
+        {"id":"windows", "path":"/windows", "enabled":true, "authMode":"oauth"},
+        {"id":"stabilitymatrix", "path":"/comfyui", "enabled":true, "authMode":"oauth"}
+    ]}).to_string();
+    let original = config.clone();
+    let (token, routes) = legacy_routes(config.as_bytes()).unwrap();
+    assert_eq!(config, original);
+    assert_eq!(routes.len(), 2);
+    let proxy =
+        Arc::new(Proxy::bind_routes(0, token, routes, Some(PathBuf::from(":memory:"))).unwrap());
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (p, s) = (proxy.clone(), shutdown.clone());
+    let join = thread::spawn(move || p.run(s).unwrap());
+    let workers: Vec<_> = [a, b].into_iter().enumerate().map(|(n, listener)| thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (head, request) = read_request(&mut stream); assert!(head.starts_with("POST /mcp "));
+        let req: Value = serde_json::from_slice(&request).unwrap();
+        let payload = json!({"jsonrpc":"2.0","id":req["id"],"result":{"which":n}}).to_string();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).unwrap();
+    })).collect();
+    for (n, path) in ["remote", "local"].iter().enumerate() {
+        let value = ureq::post(&format!("http://{}/{path}", proxy.address()))
+            .set("Authorization", &format!("Bearer {TOKEN}"))
+            .send_json(json!({"jsonrpc":"2.0","id":n,"method":"ping"}))
+            .unwrap()
+            .into_json::<Value>()
+            .unwrap();
+        assert_eq!(value["result"]["which"], n);
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let store = proxy.telemetry().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while store
+        .list(None, 10)
+        .unwrap()
+        .iter()
+        .filter(|c| c.status == "ok")
+        .count()
+        != 2
+    {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(store.list(Some("remote"), 10).unwrap().len(), 1);
+    assert_eq!(store.list(Some("local"), 10).unwrap().len(), 1);
+    stop(shutdown, join);
+}
+
+#[test]
+fn executable_reads_legacy_fixture_without_writing_it() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = upstream.local_addr().unwrap();
+    let config = json!({"token":TOKEN,"services":[{"id":"remote","path":"/remote","kind":"remote",
+        "upstream":format!("http://{addr}/mcp"),"enabled":true}]})
+    .to_string();
+    let path =
+        std::env::temp_dir().join(format!("mcp-hub-legacy-test-{}.json", std::process::id()));
+    std::fs::write(&path, &config).unwrap();
+    let worker = thread::spawn(move || {
+        let (mut stream, _) = upstream.accept().unwrap();
+        let (_, body) = read_request(&mut stream);
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        let payload = json!({"jsonrpc":"2.0","id":request["id"],"result":{}}).to_string();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).unwrap();
+    });
+    let child = Command::new(env!("CARGO_BIN_EXE_mcp-hub-rs"))
+        .arg("serve")
+        .env("MCP_HUB_CONFIG", &path)
+        .env("MCP_HUB_PORT", "0")
+        .env_remove("MCP_HUB_TOKEN")
+        .env_remove("MCP_HUB_UPSTREAM")
+        .env_remove("MCP_HUB_UPSTREAM_TOKEN")
+        .env_remove("MCP_HUB_DB")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut guard = ChildGuard(child);
+    let mut line = String::new();
+    BufReader::new(guard.0.stderr.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(!line.contains(TOKEN));
+    let base = line.trim().split_once(" at ").expect("startup failed").1;
+    let value = ureq::post(&format!("{base}/remote"))
+        .set("Authorization", &format!("Bearer {TOKEN}"))
+        .send_json(json!({"jsonrpc":"2.0","id":8,"method":"ping"}))
+        .unwrap()
+        .into_json::<Value>()
+        .unwrap();
+    assert_eq!(value["id"], 8);
+    worker.join().unwrap();
+    drop(guard);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), config);
+    std::fs::remove_file(path).unwrap();
 }
