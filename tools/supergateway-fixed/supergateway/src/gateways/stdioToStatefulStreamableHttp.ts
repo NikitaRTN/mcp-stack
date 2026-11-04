@@ -112,6 +112,7 @@ export async function stdioToStatefulStreamableHttp(
   app.post(streamableHttpPath, async (req, res) => {
     // Check for existing session ID
     const sessionId = req.headers['mcp-session-id'] as string | undefined
+    let activeSessionId = sessionId
     let transport: StreamableHTTPServerTransport
 
     if (sessionId && transports[sessionId]) {
@@ -129,18 +130,49 @@ export async function stdioToStatefulStreamableHttp(
 
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (sessionId) => {
+        onsessioninitialized: (newSessionId) => {
+          activeSessionId = newSessionId
           // Store the transport by session ID
-          transports[sessionId] = transport
+          transports[newSessionId] = transport
           // Initialize session access count
-          sessionCounter?.inc(sessionId, 'session initialization')
+          sessionCounter?.inc(newSessionId, 'session initialization')
         },
       })
       await server.connect(transport)
       const child = spawn(stdioCmd, { shell: true })
+      let childStopped = false
+      const stopChild = () => {
+        if (childStopped) return
+        childStopped = true
+        if (process.platform === 'win32' && child.pid) {
+          const killer = spawn(
+            'taskkill',
+            ['/PID', String(child.pid), '/T', '/F'],
+            { windowsHide: true },
+          )
+          killer.on('error', () => child.kill())
+        } else {
+          child.kill()
+        }
+      }
+      const initializeRequestId = (req.body as { id?: string | number | null })?.id
+      const initializeTimer = setTimeout(() => {
+        logger.error('Initialize timed out after 20000ms')
+        if (!res.headersSent) {
+          res.status(504).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'MCP initialize timed out' },
+            id: initializeRequestId ?? null,
+          })
+        }
+        Promise.resolve(transport.close()).catch(() => undefined)
+        stopChild()
+      }, 20000)
       child.on('exit', (code, signal) => {
+        childStopped = true
+        clearTimeout(initializeTimer)
         logger.error(`Child exited: code=${code}, signal=${signal}`)
-        transport.close()
+        Promise.resolve(transport.close()).catch(() => undefined)
       })
 
       let buffer = ''
@@ -153,10 +185,15 @@ export async function stdioToStatefulStreamableHttp(
           try {
             const jsonMsg = JSON.parse(line)
             logger.info('Child → StreamableHttp:', line)
+            if (jsonMsg?.id === initializeRequestId) {
+              clearTimeout(initializeTimer)
+            }
             try {
               const pendingSend = transport.send(jsonMsg)
               Promise.resolve(pendingSend).catch((e) => {
                 logger.error(`Failed to send to StreamableHttp`, e)
+                Promise.resolve(transport.close()).catch(() => undefined)
+                stopChild()
               })
             } catch (e) {
               logger.error(`Failed to send to StreamableHttp`, e)
@@ -177,29 +214,31 @@ export async function stdioToStatefulStreamableHttp(
       }
 
       transport.onclose = () => {
+        clearTimeout(initializeTimer)
         logger.info(`StreamableHttp connection closed (session ${sessionId})`)
-        if (transport.sessionId) {
+        if (activeSessionId) {
           sessionCounter?.clear(
-            transport.sessionId,
+            activeSessionId,
             false,
             'transport being closed',
           )
-          delete transports[transport.sessionId]
+          delete transports[activeSessionId]
         }
-        child.kill()
+        stopChild()
       }
 
       transport.onerror = (err) => {
+        clearTimeout(initializeTimer)
         logger.error(`StreamableHttp error (session ${sessionId}):`, err)
-        if (transport.sessionId) {
+        if (activeSessionId) {
           sessionCounter?.clear(
-            transport.sessionId,
+            activeSessionId,
             false,
             'transport emitting error',
           )
-          delete transports[transport.sessionId]
+          delete transports[activeSessionId]
         }
-        child.kill()
+        stopChild()
       }
     } else {
       // Invalid request
@@ -217,10 +256,10 @@ export async function stdioToStatefulStreamableHttp(
     // Decrement session access count when response ends
     let responseEnded = false
     const handleResponseEnd = (event: string) => {
-      if (!responseEnded && transport.sessionId) {
+      if (!responseEnded && activeSessionId) {
         responseEnded = true
-        logger.info(`Response ${event}`, transport.sessionId)
-        sessionCounter?.dec(transport.sessionId, `POST response ${event}`)
+        logger.info(`Response ${event}`, activeSessionId)
+        sessionCounter?.dec(activeSessionId, `POST response ${event}`)
       }
     }
 

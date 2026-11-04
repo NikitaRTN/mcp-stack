@@ -72,12 +72,13 @@ export async function streamableHttpToStdio(args) {
                         });
                         const originalRequest = mcpClient.request;
                         mcpClient.request = async function (possibleInitRequestMessage, ...restArgs) {
+                            const protocolVersion = message.params?.protocolVersion;
                             if (InitializeRequestSchema.safeParse(possibleInitRequestMessage)
                                 .success &&
-                                message.params?.protocolVersion) {
+                                protocolVersion) {
                                 // respect the protocol version from the stdio client's init request
-                                possibleInitRequestMessage.params.protocolVersion =
-                                    message.params.protocolVersion;
+                                const params = possibleInitRequestMessage.params;
+                                params.protocolVersion = protocolVersion;
                             }
                             result = await originalRequest.apply(this, [
                                 possibleInitRequestMessage,

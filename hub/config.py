@@ -49,7 +49,7 @@ DEFAULT_SERVICES = [
             "node \"{supergateway}\" --stdio "
             "\"npx -y @wonderwhy-er/desktop-commander@0.2.48\" "
             "--port {port} --outputTransport streamableHttp --stateful "
-            "--sessionTimeout 300000 --logLevel none"
+            "--sessionTimeout 60000 --logLevel none"
         ),
         "requires": ["node"],
         "builtin": True,
@@ -484,7 +484,7 @@ def expand_command(svc):
     local = os.environ.get("LOCALAPPDATA")
     if local:
         roblox_bat = str(Path(local) / "Roblox" / "mcp.bat")
-    windows_mcp = str(ROOT / "tools" / "windows_mcp.cmd")
+    windows_mcp = str(ROOT / "tools" / "windows_mcp.exe")
     supergateway = str(
         ROOT / "tools" / "supergateway-fixed" / "supergateway" / "dist" / "index.js"
     )

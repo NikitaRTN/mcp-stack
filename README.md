@@ -41,6 +41,16 @@
 
 Установите Python 3.8+, клонируйте репозиторий и запустите `start.bat`. Обязательных pip-пакетов нет.
 
+### Windows UI Automation MCP from source
+
+On Windows, build the native automation server before starting it from a source checkout:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/Build-WindowsMcp.ps1
+```
+
+The build requires the .NET Framework C# compiler and UI Automation assemblies. The executable is generated locally and is not committed.
+
 ## Linux / macOS
 
 ```bash

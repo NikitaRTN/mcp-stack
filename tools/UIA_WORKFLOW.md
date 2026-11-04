@@ -12,7 +12,7 @@
 Select the existing submission, then Re-Upload (not New Submission). Verify the intended addon, unchanged title, and requested visibility. Do not accept contest/legal checkboxes automatically. Submit once, then inspect Steam workshop_log.txt for the exact existing item and a successful upload result. Reopen the metadata editor to verify saved visibility; cancel that verification dialog without saving.
 
 ## Deployment and tests
-The PowerShell source is loaded when a new stateful MCP session starts. Version 1.2.0 and ten tools were confirmed through the public authenticated connection; existing sessions were not interrupted. Refresh/reconnect the Windows integration if its existing session still exposes nine tools. Hub, proxy, and Desktop service do not need restarting.
+The service runs directly as `tools/windows_mcp.exe`, built from C# source with `tools/Build-WindowsMcp.ps1`. Version 2.0.0 adds bounded UI traversal, exact process-name selectors, focus and activation helpers, and Unicode text submission. Restart the Windows service after replacing the executable.
 
 Run the opt-in desktop fixture suite in an interactive Windows session:
 

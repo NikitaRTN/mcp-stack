@@ -140,8 +140,8 @@ def _start_service_locked(sid):
         raise ValueError("Нужен Node.js — установите его на вкладке «Компоненты»")
     if "windows" in requires and not processes.IS_WINDOWS:
         raise ValueError("Этот MCP доступен только в Windows")
-    if "windows" in requires and not (config.ROOT / "tools" / "windows_mcp.cmd").exists():
-        raise ValueError("Не найден tools/windows_mcp.cmd — переустановите MCP Hub")
+    if "windows" in requires and not (config.ROOT / "tools" / "windows_mcp.exe").exists():
+        raise ValueError("Не найден tools/windows_mcp.exe — переустановите MCP Hub")
     pid = processes.spawn(proc_name(sid), command)
     BUS.publish("service.changed", {"service": sid, "action": "start", "pid": pid})
     return pid

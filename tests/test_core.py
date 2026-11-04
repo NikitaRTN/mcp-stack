@@ -27,7 +27,7 @@ class ConfigTests(unittest.TestCase):
         service = next(s for s in config.DEFAULT_SERVICES if s["id"] == "windows")
         self.assertIn("windows", service["requires"])
         command = config.expand_command(service)
-        self.assertIn("windows_mcp.cmd", command)
+        self.assertIn("windows_mcp.exe", command)
         self.assertNotIn("{windowsMcp}", command)
 
     def test_desktop_commander_uses_fixed_local_gateway(self):
@@ -35,7 +35,8 @@ class ConfigTests(unittest.TestCase):
         command = config.expand_command(service)
         self.assertIn("tools/supergateway-fixed/supergateway/dist/index.js",
                       command.replace("\\", "/"))
-        self.assertIn("--sessionTimeout 300000", command)
+        self.assertIn("--sessionTimeout 60000", command)
+        self.assertIn("npx -y @wonderwhy-er/desktop-commander", command)
         self.assertIn("--logLevel none", command)
         gateway = config.ROOT / "tools" / "supergateway-fixed" / "supergateway"
         patched = (gateway / "dist" / "gateways" /

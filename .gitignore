@@ -12,3 +12,6 @@ Thumbs.db
 
 # Local npm dependencies are restored by the installer
 node_modules/
+
+# Rebuilt locally and in GitHub Actions from windows_mcp.cs
+/tools/windows_mcp.exe

@@ -1,3 +1,11 @@
+# Windows UI Automation 2.0.0 and MCP startup reliability (2026-09-11)
+
+- Replaced the PowerShell Windows automation server with a directly executed C# service exposing 16 bounded UI tools.
+- Added exact process-name selectors, atomic Unicode text submission, explicit activation/focus/type helpers, and safe coordinate fallbacks.
+- Added reproducible Windows compilation from `tools/windows_mcp.cs`; GitHub tests and release builds no longer depend on a committed executable.
+- Desktop Commander uses a shorter stale-session timeout; the existing npm-based installer remains compatible.
+- Stateful stdio initialization now has a bounded timeout and tears down child process trees after failed or closed sessions.
+- Updated protocol regression tests and the scoped Windows UI workflow. Runtime profiles, credentials, binaries, logs, backups, and Workshop publisher state remain excluded.
 # MCP reliability and Windows UI Automation 1.2.0 (2026-09-06)
 
 - Keep existing service processes and sessions on repeated Start/Enable; require explicit restart after command changes.
