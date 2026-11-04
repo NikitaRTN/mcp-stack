@@ -3,6 +3,9 @@ use serde_json::Value;
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "serve" {
+        return serve();
+    }
     if args.len() == 2 && args[1] == "--version" {
         println!(
             "mcp-hub-rs {} (experimental MCP client)",
@@ -36,4 +39,26 @@ fn main() {
         eprintln!("{error}");
         std::process::exit(1);
     }
+}
+
+fn serve() -> Result<(), String> {
+    use mcp_hub_rs::server::{Proxy, Settings};
+    use std::sync::{atomic::AtomicBool, Arc};
+    let port = std::env::var("MCP_HUB_PORT")
+        .unwrap_or_else(|_| "8765".into())
+        .parse::<u16>()
+        .map_err(|_| "invalid MCP_HUB_PORT")?;
+    let settings = Settings {
+        port,
+        upstream: std::env::var("MCP_HUB_UPSTREAM").map_err(|_| "MCP_HUB_UPSTREAM is required")?,
+        access_token: std::env::var("MCP_HUB_TOKEN").map_err(|_| "MCP_HUB_TOKEN is required")?,
+        upstream_token: std::env::var("MCP_HUB_UPSTREAM_TOKEN").ok(),
+        telemetry_db: std::env::var_os("MCP_HUB_DB").map(Into::into),
+    };
+    let proxy = Arc::new(Proxy::bind(settings)?);
+    eprintln!(
+        "Experimental MCP proxy listening at http://{}/mcp",
+        proxy.address()
+    );
+    proxy.run(Arc::new(AtomicBool::new(false)))
 }
