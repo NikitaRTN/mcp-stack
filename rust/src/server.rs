@@ -34,6 +34,7 @@ struct Route {
     id: String,
     upstream: Url,
     upstream_token: Option<String>,
+    oauth: Option<crate::oauth_client::ClientCredentials>,
 }
 struct Management {
     key: hmac::Key,
@@ -157,6 +158,7 @@ impl Proxy {
                         id: spec.id,
                         upstream,
                         upstream_token: spec.upstream_token,
+                        oauth: None,
                     },
                 )
                 .is_some()
@@ -198,6 +200,27 @@ impl Proxy {
             auth_digest,
             telemetry,
         })
+    }
+    /// Enable client-credentials auth for one preconfigured route before running the proxy.
+    pub fn enable_upstream_oauth(
+        &mut self,
+        id: &str,
+        settings: crate::oauth_client::Settings,
+    ) -> Result<(), String> {
+        let route = self
+            .routes
+            .values_mut()
+            .find(|r| r.id == id)
+            .ok_or("unknown OAuth route")?;
+        if route.upstream_token.is_some()
+            || route.oauth.is_some()
+            || (route.upstream.scheme() != "https"
+                && !route.upstream.host_str().is_some_and(loopback_host))
+        {
+            return Err("OAuth upstream must use HTTPS or loopback and no other credential".into());
+        }
+        route.oauth = Some(crate::oauth_client::ClientCredentials::new(settings)?);
+        Ok(())
     }
     /// Explicit opt-in. The management credential must differ from the proxy credential.
     pub fn enable_management(
@@ -441,7 +464,25 @@ impl Proxy {
         for (name, value) in &forwarded {
             upstream = upstream.set(name, value);
         }
-        if let Some(token) = &route.upstream_token {
+        if let Some(oauth) = &route.oauth {
+            match oauth.token() {
+                Ok(token) => upstream = upstream.set("Authorization", &format!("Bearer {token}")),
+                Err(_) => {
+                    if let Some(store) = &self.telemetry {
+                        for p in pending {
+                            let _ = store.finish(
+                                p.row,
+                                "error",
+                                Some("OAuth token request failed"),
+                                0,
+                                None,
+                            );
+                        }
+                    }
+                    return reply(req, 502, "OAuth token request failed");
+                }
+            }
+        } else if let Some(token) = &route.upstream_token {
             upstream = upstream.set("Authorization", &format!("Bearer {token}"));
         }
         let response = if method == "POST" {

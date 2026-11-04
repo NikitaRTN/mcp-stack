@@ -25,6 +25,7 @@ fn managed_service_helper() {
         assert!(std::env::var_os("MCP_HUB_TOKEN").is_none());
         assert!(std::env::var_os("MCP_HUB_ADMIN_TOKEN").is_none());
         assert!(std::env::var_os("MCP_HUB_UPSTREAM_TOKEN").is_none());
+        assert!(std::env::var_os("MCP_HUB_OAUTH_CLIENT_SECRET").is_none());
     }
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
     listener.set_nonblocking(true).unwrap();

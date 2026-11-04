@@ -71,6 +71,33 @@ fn serve() -> Result<(), String> {
         };
         (Proxy::bind(settings)?, "/mcp")
     };
+    let oauth_names = [
+        "MCP_HUB_OAUTH_TOKEN_URL",
+        "MCP_HUB_OAUTH_CLIENT_ID",
+        "MCP_HUB_OAUTH_CLIENT_SECRET",
+        "MCP_HUB_OAUTH_SCOPE",
+        "MCP_HUB_OAUTH_AUDIENCE",
+        "MCP_HUB_OAUTH_AUTH_METHOD",
+        "MCP_HUB_OAUTH_ROUTE",
+    ];
+    if oauth_names
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        let required =
+            |name| std::env::var(name).map_err(|_| "incomplete OAuth client configuration");
+        let settings = mcp_hub_rs::oauth_client::Settings {
+            token_url: required("MCP_HUB_OAUTH_TOKEN_URL")?,
+            client_id: required("MCP_HUB_OAUTH_CLIENT_ID")?,
+            client_secret: required("MCP_HUB_OAUTH_CLIENT_SECRET")?,
+            scope: std::env::var("MCP_HUB_OAUTH_SCOPE").ok(),
+            audience: std::env::var("MCP_HUB_OAUTH_AUDIENCE").ok(),
+            auth_method: std::env::var("MCP_HUB_OAUTH_AUTH_METHOD")
+                .unwrap_or_else(|_| "basic".into()),
+        };
+        let route = std::env::var("MCP_HUB_OAUTH_ROUTE").unwrap_or_else(|_| "default".into());
+        proxy.enable_upstream_oauth(&route, settings)?;
+    }
     match (
         std::env::var_os("MCP_HUB_PROCESS_CONFIG"),
         std::env::var("MCP_HUB_ADMIN_TOKEN").ok(),

@@ -5,6 +5,7 @@ pub mod events;
 pub mod inspector;
 pub mod managed;
 pub mod migration;
+pub mod oauth_client;
 pub mod process;
 pub mod server;
 pub mod telemetry;
