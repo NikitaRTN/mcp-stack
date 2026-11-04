@@ -243,6 +243,27 @@ impl Proxy {
     }
     pub fn run(self: Arc<Self>, shutdown: Arc<AtomicBool>) -> Result<(), String> {
         let mut workers = Vec::new();
+        if self.management.is_some() {
+            let proxy = self.clone();
+            let stop = shutdown.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut reported = false;
+                while !stop.load(Ordering::Relaxed) {
+                    let failed = proxy
+                        .management
+                        .as_ref()
+                        .unwrap()
+                        .processes
+                        .reap_exited()
+                        .is_err();
+                    if failed && !reported {
+                        eprintln!("process monitor failed; retrying");
+                    }
+                    reported = failed;
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }));
+        }
         for _ in 0..WORKERS {
             let proxy = self.clone();
             let stop = shutdown.clone();

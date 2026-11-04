@@ -149,6 +149,34 @@ impl ProcessManager {
         }))
     }
 
+    /// Inspect all owned processes so exited leaders and their descendants are cleaned up.
+    pub fn reap_exited(&self) -> Result<usize, &'static str> {
+        let mut children = self
+            .children
+            .lock()
+            .map_err(|_| "process manager unavailable")?;
+        let mut exited = Vec::new();
+        let mut failed = false;
+        for (name, entry) in children.iter_mut() {
+            match entry.tree.poll(&mut entry.child) {
+                Ok(Some(status)) => exited.push((name.clone(), entry.child.id(), status.success())),
+                Ok(None) => {}
+                Err(_) => failed = true,
+            }
+        }
+        for (name, pid, success) in &exited {
+            children.remove(name);
+            let _ = self.bus.publish(
+                "process.exited",
+                json!({"name": name, "pid": pid, "success": success}),
+            );
+        }
+        if failed {
+            return Err("cannot inspect some processes");
+        }
+        Ok(exited.len())
+    }
+
     /// Terminates an owned Windows job or Unix process group, never a persisted PID.
     pub fn stop(&self, name: &str) -> Result<bool, &'static str> {
         let mut children = self
@@ -352,7 +380,7 @@ mod tests {
         ];
         s.env.insert(
             "MCP_HUB_TREE_ROLE".into(),
-            if mode == 2 { "parent-exit" } else { "parent" }.into(),
+            if mode >= 2 { "parent-exit" } else { "parent" }.into(),
         );
         s.env
             .insert("MCP_HUB_TREE_GATE".into(), gate.as_os_str().into());
@@ -367,7 +395,14 @@ mod tests {
             assert!(Instant::now() < deadline, "grandchild did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
-        if mode == 2 {
+        if mode == 3 {
+            while manager.reap_exited().unwrap() == 0 {
+                assert!(Instant::now() < deadline, "monitor did not reap parent");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(manager.status("tree").unwrap().is_none());
+            drop(manager);
+        } else if mode == 2 {
             while manager.status("tree").unwrap().is_some() {
                 assert!(Instant::now() < deadline, "parent did not exit");
                 std::thread::sleep(Duration::from_millis(20));
@@ -401,5 +436,10 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     fn natural_parent_exit_terminates_spawned_tree() {
         check_tree_shutdown(2);
+    }
+    #[test]
+    #[cfg(any(windows, target_os = "linux"))]
+    fn monitor_reaps_exited_parent_and_terminates_tree() {
+        check_tree_shutdown(3);
     }
 }

@@ -236,3 +236,102 @@ fn executable_enables_explicit_management_config() {
     assert_eq!(std::fs::read_to_string(config).unwrap(), contents);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+#[allow(clippy::zombie_processes)] // test parent deliberately exits before its child
+fn monitor_tree_helper() {
+    use std::process::{Command, Stdio};
+    let Ok(role) = std::env::var("MCP_TEST_MONITOR_ROLE") else {
+        return;
+    };
+    let activity = std::env::var_os("MCP_TEST_MONITOR_ACTIVITY").unwrap();
+    if role == "leaf" {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(activity)
+            .unwrap();
+        for _ in 0..500 {
+            file.write_all(b"x").unwrap();
+            file.flush().unwrap();
+            thread::sleep(Duration::from_millis(20));
+        }
+    } else {
+        let gate = std::path::PathBuf::from(std::env::var_os("MCP_TEST_MONITOR_GATE").unwrap());
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !gate.exists() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "monitor_tree_helper", "--nocapture"])
+            .env("MCP_TEST_MONITOR_ROLE", "leaf")
+            .env("MCP_TEST_MONITOR_ACTIVITY", &activity)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        while std::fs::metadata(&activity).map(|m| m.len()).unwrap_or(0) < 3 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn proxy_monitor_cleans_descendants_without_status_requests() {
+    let dir = std::env::temp_dir().join(format!(
+        "mcp-monitor-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let activity = dir.join("activity");
+    let gate = dir.join("gate");
+    let config = json!({"services":[{"id":"default","program":std::env::current_exe().unwrap(),"args":["--exact","monitor_tree_helper","--nocapture"],"env":{"MCP_TEST_MONITOR_ROLE":"parent","MCP_TEST_MONITOR_ACTIVITY":activity,"MCP_TEST_MONITOR_GATE":gate},"log":dir.join("log")}]});
+    let mut proxy = Proxy::bind(Settings {
+        port: 0,
+        upstream: "http://127.0.0.1:9/mcp".into(),
+        access_token: TOKEN.into(),
+        upstream_token: None,
+        telemetry_db: None,
+    })
+    .unwrap();
+    proxy
+        .enable_management(
+            ADMIN.into(),
+            managed::read_config(config.to_string().as_bytes()).unwrap(),
+        )
+        .unwrap();
+    let proxy = Arc::new(proxy);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (p, s) = (proxy.clone(), stop.clone());
+    let join = thread::spawn(move || p.run(s).unwrap());
+    let url = format!("http://{}/_hub/services/default", proxy.address());
+    ureq::post(&url)
+        .set("Authorization", &format!("Bearer {ADMIN}"))
+        .send_string("")
+        .unwrap();
+    std::fs::write(&gate, b"go").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while std::fs::metadata(&activity).map(|m| m.len()).unwrap_or(0) < 3 {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(1500));
+    let size = std::fs::metadata(&activity).unwrap().len();
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        std::fs::metadata(&activity).unwrap().len(),
+        size,
+        "monitor did not terminate descendants"
+    );
+    stop.store(true, Ordering::Relaxed);
+    join.join().unwrap();
+    drop(proxy);
+    std::fs::remove_dir_all(dir).unwrap();
+}
