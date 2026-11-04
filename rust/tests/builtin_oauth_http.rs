@@ -55,6 +55,7 @@ fn builtin_oauth_http_flow_and_fail_closed_access() {
                 base: base.clone(),
                 path: String::new(),
                 scopes: vec!["mcp:tools".into()],
+                proxy_key: None,
             },
         )
         .unwrap();
@@ -248,6 +249,7 @@ fn executable_accepts_explicit_builtin_configuration() {
         "MCP_HUB_OAUTH_TOKEN_URL",
         "MCP_HUB_OAUTH_CLIENT_ID",
         "MCP_HUB_OAUTH_CLIENT_SECRET",
+        "MCP_HUB_TRUSTED_PROXY_KEY",
     ] {
         command.env_remove(k);
     }
@@ -281,4 +283,326 @@ fn executable_accepts_explicit_builtin_configuration() {
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(ok, "executable did not serve built-in OAuth metadata");
+}
+
+#[test]
+fn trusted_https_proxy_boundary_and_secure_cookie() {
+    let upstream = Server::http("127.0.0.1:0").unwrap();
+    let target = format!("http://{}/mcp", upstream.server_addr());
+    let upstream_thread = thread::spawn(move || {
+        let req = upstream
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap()
+            .unwrap();
+        assert!(!req
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("Authorization") || h.field.equiv("X-Mcp-Hub-Proxy-Key")));
+        req.respond(
+            Response::from_string("{\"ok\":true}")
+                .with_header(Header::from_bytes("Content-Type", "application/json").unwrap()),
+        )
+        .unwrap();
+    });
+    let mut proxy = Proxy::bind(Settings {
+        port: 0,
+        upstream: target,
+        access_token: "static-token-0123456789-abcdef".into(),
+        upstream_token: None,
+        telemetry_db: None,
+    })
+    .unwrap();
+    let local = format!("http://{}", proxy.address());
+    let base = "https://mcp.example.test";
+    let key = "proxy-key-abcdefghijklmnopqrstuvwxyz-123456789";
+    let db = std::env::temp_dir().join(format!("mcp-public-oauth-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+    proxy
+        .enable_builtin_oauth(
+            "default",
+            Config {
+                database: db.clone(),
+                signing_key: "test-key-for-oauth".into(),
+                auth: create_password("admin", "correct-password").unwrap(),
+                base: base.into(),
+                path: String::new(),
+                scopes: vec!["mcp:tools".into()],
+                proxy_key: Some(key.into()),
+            },
+        )
+        .unwrap();
+    let proxy = Arc::new(proxy);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (p, s) = (proxy.clone(), stop.clone());
+    let worker = thread::spawn(move || p.run(s).unwrap());
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(10))
+        .build();
+    let metadata = format!("{local}/.well-known/oauth-authorization-server");
+    assert!(matches!(
+        agent.get(&metadata).call(),
+        Err(ureq::Error::Status(403, _))
+    ));
+    assert!(matches!(
+        agent.get(&metadata).set("Host", "mcp.example.test").call(),
+        Err(ureq::Error::Status(403, _))
+    ));
+    assert!(matches!(
+        agent
+            .get(&metadata)
+            .set("Host", "mcp.example.test")
+            .set("X-Mcp-Hub-Proxy-Key", "wrong")
+            .call(),
+        Err(ureq::Error::Status(403, _))
+    ));
+    assert!(matches!(
+        agent
+            .get(&metadata)
+            .set("Host", "attacker.test")
+            .set("X-Mcp-Hub-Proxy-Key", key)
+            .call(),
+        Err(ureq::Error::Status(403, _))
+    ));
+    assert!(matches!(
+        agent
+            .get(&metadata)
+            .set("Host", "mcp.example.test")
+            .set("X-Mcp-Hub-Proxy-Key", key)
+            .set("Origin", "https://evil.test")
+            .call(),
+        Err(ureq::Error::Status(403, _))
+    ));
+    let info: Value = agent
+        .get(&metadata)
+        .set("Host", "mcp.example.test")
+        .set("X-Mcp-Hub-Proxy-Key", key)
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(info["issuer"], base);
+    let client: Value = agent
+        .post(&format!("{local}/oauth/register"))
+        .set("Host", "mcp.example.test")
+        .set("X-Mcp-Hub-Proxy-Key", key)
+        .send_json(json!({"redirect_uris":["https://client.example/callback"]}))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let id = client["client_id"].as_str().unwrap();
+    let verifier = "v".repeat(64);
+    let challenge =
+        URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, verifier.as_bytes()).as_ref());
+    let mut authorize = Url::parse(&format!("{local}/oauth/authorize")).unwrap();
+    authorize
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", id)
+        .append_pair("redirect_uri", "https://client.example/callback")
+        .append_pair("resource", &format!("{base}/mcp"))
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256");
+    let response = agent
+        .get(authorize.as_str())
+        .set("Host", "mcp.example.test")
+        .set("X-Mcp-Hub-Proxy-Key", key)
+        .call()
+        .unwrap();
+    let set_cookie = response.header("Set-Cookie").unwrap();
+    assert!(set_cookie.contains("; Secure"));
+    assert!(set_cookie.contains("SameSite=Strict"));
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+    let nonce = cookie.strip_prefix("mcp_oauth_nonce=").unwrap();
+    let consent = agent
+        .post(&format!("{local}/oauth/authorize"))
+        .set("Host", "mcp.example.test")
+        .set("X-Mcp-Hub-Proxy-Key", key)
+        .set("Origin", base)
+        .set("Cookie", &cookie)
+        .send_form(&[
+            ("nonce", nonce),
+            ("action", "allow"),
+            ("password", "correct-password"),
+        ]);
+    let consent = match consent {
+        Err(ureq::Error::Status(303, r)) => r,
+        Ok(r) if r.status() == 303 => r,
+        _ => panic!("expected redirect"),
+    };
+    assert!(consent.header("Set-Cookie").unwrap().contains("; Secure"));
+    let redirect = Url::parse(consent.header("Location").unwrap()).unwrap();
+    let code = redirect
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .unwrap()
+        .1
+        .into_owned();
+    let fields = [
+        ("grant_type", "authorization_code"),
+        ("client_id", id),
+        ("redirect_uri", "https://client.example/callback"),
+        ("code", code.as_str()),
+        ("code_verifier", verifier.as_str()),
+    ];
+    let token: Value = agent
+        .post(&format!("{local}/oauth/token"))
+        .set("Host", "mcp.example.test")
+        .set("X-Mcp-Hub-Proxy-Key", key)
+        .send_form(&fields)
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let access = token["access_token"].as_str().unwrap();
+    let response = agent
+        .post(&format!("{local}/mcp"))
+        .set("Host", "mcp.example.test")
+        .set("X-Mcp-Hub-Proxy-Key", key)
+        .set("Authorization", &format!("Bearer {access}"))
+        .send_json(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    upstream_thread.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    drop(proxy);
+    let _ = std::fs::remove_file(db);
+}
+
+#[test]
+fn caddy_tls_overwrites_untrusted_header_when_available() {
+    use std::{
+        net::TcpListener,
+        process::{Command, Stdio},
+    };
+    let Ok(binary) = std::env::var("CADDY_TEST_BIN") else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("mcp-caddy-oauth-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tls_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let base = format!("https://localhost:{tls_port}");
+    let key = "test-proxy-key-abcdefghijklmnopqrstuvwxyz-123456789";
+    let mut proxy = Proxy::bind(Settings {
+        port: 0,
+        upstream: "http://127.0.0.1:1/mcp".into(),
+        access_token: "static-token-0123456789-abcdef".into(),
+        upstream_token: None,
+        telemetry_db: None,
+    })
+    .unwrap();
+    proxy
+        .enable_builtin_oauth(
+            "default",
+            Config {
+                database: dir.join("oauth.db"),
+                signing_key: "test-key-for-oauth".into(),
+                auth: create_password("admin", "correct-password").unwrap(),
+                base: base.clone(),
+                path: String::new(),
+                scopes: vec!["mcp:tools".into()],
+                proxy_key: Some(key.into()),
+            },
+        )
+        .unwrap();
+    let target = proxy.address();
+    let proxy = Arc::new(proxy);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (p, s) = (proxy.clone(), stop.clone());
+    let worker = thread::spawn(move || p.run(s).unwrap());
+    let file = dir.join("Caddyfile");
+    std::fs::write(&file,format!("{{\n admin off\n auto_https disable_redirects\n skip_install_trust\n}}\n{base} {{\n tls internal\n @hub path /mcp /oauth/* /.well-known/oauth-authorization-server /.well-known/openid-configuration /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/mcp\n handle @hub {{\n  reverse_proxy {target} {{\n   header_up X-Mcp-Hub-Proxy-Key {key}\n  }}\n }}\n handle {{\n  respond 404\n }}\n}}\n")).unwrap();
+    struct Guard(std::process::Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let child = Command::new(binary)
+        .args(["run", "--adapter", "caddyfile", "--config"])
+        .arg(&file)
+        .env("XDG_DATA_HOME", &dir)
+        .env("XDG_CONFIG_HOME", &dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = Guard(child);
+    let mut passed = false;
+    for _ in 0..100 {
+        if child.0.try_wait().unwrap().is_some() {
+            break;
+        }
+        let out = Command::new("curl")
+            .args([
+                "--silent",
+                "--insecure",
+                "--max-time",
+                "1",
+                "-H",
+                "X-Mcp-Hub-Proxy-Key: attacker",
+                &format!("{base}/.well-known/oauth-authorization-server"),
+            ])
+            .output()
+            .unwrap();
+        if out.status.success() {
+            if let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) {
+                if v["issuer"] == base {
+                    passed = true;
+                    break;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    drop(child);
+    stop.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(passed, "Caddy HTTPS forwarding failed");
+}
+
+#[test]
+fn rejects_misconfigured_public_oauth_without_touching_old_installation() {
+    for (base, key) in [
+        ("https://mcp.example.test", None),
+        ("http://mcp.example.test", Some("a".repeat(43))),
+        ("https://mcp.example.test", Some("short".into())),
+        ("https://mcp.example.test", Some("{".repeat(43))),
+        (
+            "https://user:password@mcp.example.test",
+            Some("a".repeat(43)),
+        ),
+        ("https://mcp.example.test/path", Some("a".repeat(43))),
+    ] {
+        let mut proxy = Proxy::bind(Settings {
+            port: 0,
+            upstream: "http://127.0.0.1:1/mcp".into(),
+            access_token: "static-token-0123456789-abcdef".into(),
+            upstream_token: None,
+            telemetry_db: None,
+        })
+        .unwrap();
+        let db = std::env::temp_dir().join(format!("mcp-bad-oauth-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let result = proxy.enable_builtin_oauth(
+            "default",
+            Config {
+                database: db.clone(),
+                signing_key: "test-signing-key".into(),
+                auth: create_password("admin", "correct-password").unwrap(),
+                base: base.into(),
+                path: String::new(),
+                scopes: vec!["mcp:tools".into()],
+                proxy_key: key,
+            },
+        );
+        assert!(result.is_err());
+        assert!(!db.exists());
+    }
 }

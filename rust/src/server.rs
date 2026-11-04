@@ -301,10 +301,12 @@ impl Proxy {
         if route.inbound_oauth.is_some() {
             return Err("route already has inbound OAuth".into());
         }
-        let base_local = format!("http://localhost:{}", self.address.port());
-        let base_ip = format!("http://127.0.0.1:{}", self.address.port());
-        if config.base != base_local && config.base != base_ip {
-            return Err("OAuth base must match the loopback listener".into());
+        if config.proxy_key.is_none() {
+            let base_local = format!("http://localhost:{}", self.address.port());
+            let base_ip = format!("http://127.0.0.1:{}", self.address.port());
+            if config.base != base_local && config.base != base_ip {
+                return Err("OAuth base must match the loopback listener".into());
+            }
         }
         config.path = path.clone();
         self.builtin = Some(crate::oauth_builtin_http::Builtin::new(config)?);
@@ -494,20 +496,42 @@ impl Proxy {
         };
         let local_host = format!("localhost:{}", self.address.port());
         let ip_host = format!("127.0.0.1:{}", self.address.port());
-        if !host.eq_ignore_ascii_case(&local_host) && !host.eq_ignore_ascii_case(&ip_host) {
-            return reply(req, 403, "invalid host");
-        }
-        match header(&req, "Origin") {
-            Ok(Some(origin))
-                if origin != format!("http://{ip_host}")
-                    && origin != format!("http://{local_host}") =>
-            {
-                return reply(req, 403, "invalid origin")
-            }
-            Err(_) => return reply(req, 400, "invalid origin"),
-            _ => {}
-        }
         let route_path = req.url().split('?').next().unwrap_or("");
+        let public_builtin = self.builtin.as_ref().filter(|b| {
+            b.public_host().is_some() && (b.handles(route_path) || b.path() == route_path)
+        });
+        if let Some(builtin) = public_builtin {
+            let proxy_key = match header(&req, "X-Mcp-Hub-Proxy-Key") {
+                Ok(Some(v)) => v,
+                _ => return reply(req, 403, "untrusted proxy"),
+            };
+            if !host.eq_ignore_ascii_case(builtin.public_host().unwrap())
+                || !builtin.trusted_proxy(&proxy_key)
+            {
+                return reply(req, 403, "untrusted proxy");
+            }
+            match header(&req, "Origin") {
+                Ok(Some(origin)) if origin != builtin.origin() => {
+                    return reply(req, 403, "invalid origin")
+                }
+                Err(_) => return reply(req, 400, "invalid origin"),
+                _ => {}
+            }
+        } else {
+            if !host.eq_ignore_ascii_case(&local_host) && !host.eq_ignore_ascii_case(&ip_host) {
+                return reply(req, 403, "invalid host");
+            }
+            match header(&req, "Origin") {
+                Ok(Some(origin))
+                    if origin != format!("http://{ip_host}")
+                        && origin != format!("http://{local_host}") =>
+                {
+                    return reply(req, 403, "invalid origin")
+                }
+                Err(_) => return reply(req, 400, "invalid origin"),
+                _ => {}
+            }
+        }
         if let Some(builtin) = &self.builtin {
             if builtin.handles(route_path) {
                 return builtin.handle(req);

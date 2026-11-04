@@ -195,11 +195,12 @@ fn serve() -> Result<(), String> {
                 base: text("base")?,
                 path: String::new(),
                 scopes,
+                proxy_key: std::env::var("MCP_HUB_TRUSTED_PROXY_KEY").ok(),
             };
             let route = v.get("route").and_then(Value::as_str).unwrap_or("default");
             proxy.enable_builtin_oauth(route, config)?;
         }
-        (None, None) => {}
+        (None, None) if std::env::var_os("MCP_HUB_TRUSTED_PROXY_KEY").is_none() => {}
         _ => {
             return Err(
                 "MCP_HUB_BUILTIN_CONFIG and MCP_HUB_BUILTIN_SIGNING_KEY must be set together"

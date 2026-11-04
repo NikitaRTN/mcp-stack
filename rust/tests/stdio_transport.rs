@@ -20,6 +20,8 @@ fn fixture() {
         "MCP_HUB_UPSTREAM_TOKEN",
         "MCP_HUB_OAUTH_CLIENT_SECRET",
         "MCP_HUB_INTROSPECTION_CLIENT_SECRET",
+        "MCP_HUB_BUILTIN_SIGNING_KEY",
+        "MCP_HUB_TRUSTED_PROXY_KEY",
     ] {
         assert!(
             std::env::var_os(name).is_none(),
@@ -98,7 +100,14 @@ fn main() {
         env,
         log: log.clone(),
     };
+    std::env::set_var(
+        "MCP_HUB_BUILTIN_SIGNING_KEY",
+        "test-signing-key-not-for-child",
+    );
+    std::env::set_var("MCP_HUB_TRUSTED_PROXY_KEY", "test-proxy-key-not-for-child");
     let session = StdioTransport::spawn(&spec).unwrap();
+    std::env::remove_var("MCP_HUB_BUILTIN_SIGNING_KEY");
+    std::env::remove_var("MCP_HUB_TRUSTED_PROXY_KEY");
     assert!(session.send(&json!({"not":"jsonrpc"})).is_err());
     session
         .send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
@@ -443,6 +452,9 @@ fn executable_test(spec: &ProcessSpec) {
         "MCP_HUB_INTROSPECTION_AUDIENCE",
         "MCP_HUB_INTROSPECTION_ISSUER",
         "MCP_HUB_INTROSPECTION_ROUTE",
+        "MCP_HUB_BUILTIN_CONFIG",
+        "MCP_HUB_BUILTIN_SIGNING_KEY",
+        "MCP_HUB_TRUSTED_PROXY_KEY",
     ] {
         process.env_remove(name);
     }

@@ -1,6 +1,6 @@
 # Rust incremental port
 
-This is an **experimental MCP client and local proxy**, not a replacement for MCP Hub. The existing Python Hub remains the supported application. The Rust port does not yet provide the panel, full service management, OAuth, production telemetry, Caddy integration or ComfyUI. Do not use this build to replace an existing installation or migrate its configuration.
+This is an **experimental MCP client and local proxy**, not a replacement for MCP Hub. The existing Python Hub remains the supported application. The Rust port does not yet provide the panel, full service management, production-ready OAuth, production telemetry, integrated Caddy management or ComfyUI. Do not use this build to replace an existing installation or migrate its configuration.
 
 The current slice supports Streamable HTTP MCP initialization, session IDs, paginated `tools/list`, `tools/call`, JSON and SSE responses, and optional bearer authentication. Redirects are disabled to avoid forwarding credentials to a different server. Only pass bearer tokens to a trusted HTTPS server or a trusted local endpoint.
 
@@ -58,7 +58,7 @@ This replaces static bearer access on that route, without a fallback to `MCP_HUB
 
 The confidential introspection client secret is omitted from managed/stdin child environments unless explicitly re-added by trusted process configuration. Native stdio sessions are bound to a SHA-256 digest of the validated bearer credential. Another valid credential cannot use or delete the session; token rotation requires a new MCP session. This binds sessions to credentials, not to a stable user identity across refreshed tokens. This is only external RFC 7662 validation, not built-in authorization, discovery, registration, PKCE, refresh-token issuance or automatic legacy OAuth migration. The local proxy remains experimental and loopback-only.
 
-### Experimental built-in OAuth (loopback only)
+### Experimental built-in OAuth
 
 For an isolated test only, set `MCP_HUB_BUILTIN_CONFIG` to a JSON file and `MCP_HUB_BUILTIN_SIGNING_KEY` to a strong random secret of at least 32 characters. The signing key must remain stable across restarts; protect it and the configuration file. Example configuration (replace the password record with a trusted Python-compatible PBKDF2 `auth` object; use a new absolute database path):
 
@@ -66,8 +66,34 @@ For an isolated test only, set `MCP_HUB_BUILTIN_CONFIG` to a JSON file and `MCP_
 {"base":"http://127.0.0.1:8765","database":"/absolute/path/to/new-oauth-test.db","route":"default","scopes":["mcp:tools"],"auth":{"username":"admin","algorithm":"pbkdf2_sha256","iterations":240000,"salt":"BASE64_SALT","hash":"BASE64_HASH"}}
 ```
 
-On Windows the absolute database path must use JSON-escaped backslashes. The base must match the actual listener (`http://127.0.0.1:PORT` or `http://localhost:PORT`). It is intentionally loopback-only: public HTTPS, Caddy deployment, and production use are not supported. Do not point the config or database at an existing installation. The existing static proxy token remains necessary to start the experimental proxy, but cannot authenticate to the OAuth-protected route. Do not combine built-in OAuth with external introspection on that route. Other routes retain their configured protection.
+On Windows the absolute database path must use JSON-escaped backslashes. For direct local testing, the base must match the actual listener (`http://127.0.0.1:PORT` or `http://localhost:PORT`). The server always binds to loopback. Public HTTPS requires the explicitly configured trusted reverse proxy described below; neither mode is production-ready. Do not point the config or database at an existing installation. The existing static proxy token remains necessary to start the experimental proxy, but cannot authenticate to the OAuth-protected route. Do not combine built-in OAuth with external introspection on that route. Other routes retain their configured protection.
 
 The test flow exposes authorization-server and protected-resource discovery, public client registration, owner-password consent, authorization code with PKCE S256, access tokens and rotating single-use refresh tokens. Clients, hashed authorization codes and hashed refresh tokens persist in the explicitly selected SQLite database; the signing key is never stored in that database. Store the database in an access-controlled directory. The code and refresh token are bound to client and resource; scopes cannot be expanded. Reuse of a code or refresh token fails. The browser consent nonce is short-lived, single-use and bound to a SameSite cookie; failed password attempts trigger the existing lockout. Signing key is removed from managed and stdio child environments unless explicitly re-added in trusted process configuration.
 
-Limitations: this is a new, single-resource implementation, not automatic migration from the Python Hub. Python `mh1` access-token signatures are compatible when the same key and claims are used, but registered clients and refresh-token state are not imported; old refresh tokens cannot be used. There is no token revocation endpoint, client-management interface, production-grade rate limiting, HTTPS listener, reverse-proxy trust model, or full parity/security review. Access tokens already issued remain valid until expiry even after refresh-token rotation. Consent state is in memory and is lost on restart; clients and hashed outstanding codes/refresh tokens persist. The loopback HTTP worker pool remains vulnerable to slow local peers. Do not expose this experiment publicly or use it as a replacement for the Python Hub.
+Limitations: this is a new, single-resource implementation, not automatic migration from the Python Hub. Python `mh1` access-token signatures are compatible when the same key and claims are used, but registered clients and refresh-token state are not imported; old refresh tokens cannot be used. There is no token revocation endpoint, client-management interface, production-grade rate limiting, integrated HTTPS listener or full parity/security review. Access tokens already issued remain valid until expiry even after refresh-token rotation. Consent state is in memory and is lost on restart; clients and hashed outstanding codes/refresh tokens persist. The loopback HTTP worker pool remains vulnerable to slow local peers. Do not use it as a replacement for the Python Hub.
+
+#### Trusted HTTPS proxy experiment
+
+For an isolated HTTPS test, set `base` to the exact HTTPS origin, for example `https://mcp.example.com`, and set `MCP_HUB_TRUSTED_PROXY_KEY` for both the Hub and its dedicated Caddy process to the same independent, cryptographically random secret (at least 32 random bytes encoded as unpadded base64url). Only letters, digits, `_` and `-` are accepted. Keep both this key and the separate signing key private. In public mode, every OAuth endpoint and the selected MCP route requires the key in `X-Mcp-Hub-Proxy-Key` and the configured Host; direct loopback access to those routes is rejected without it. Caddy must **overwrite**, not append or forward, any client-provided header. The Hub does not forward that header or the OAuth bearer to the MCP upstream. The public browser Origin must match the configured HTTPS origin; consent cookies have `Secure`, `HttpOnly` and `SameSite=Strict` attributes.
+
+A dedicated, isolated Caddyfile for the example above and a `/mcp` route is:
+
+```caddyfile
+{
+    admin off
+}
+https://mcp.example.com {
+    @hub path /mcp /oauth/* /.well-known/oauth-authorization-server /.well-known/openid-configuration /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/mcp
+    handle @hub {
+        reverse_proxy 127.0.0.1:8765 {
+            header_up X-Mcp-Hub-Proxy-Key {$MCP_HUB_TRUSTED_PROXY_KEY}
+            flush_interval -1
+        }
+    }
+    handle {
+        respond 404
+    }
+}
+```
+
+Run Caddy with a valid publicly trusted certificate, the secret environment variable, and a protected configuration; use the actual route in both path entries. Do not configure access logging of authorization requests or token responses. Restrict access to the Hub host and environment. This is an experimental dedicated proxy configuration, not automatic integration with the legacy Caddy manager. Other Hub routes and the panel are not published by this snippet. The HTTP worker pool is not hardened against untrusted slow clients; do not rely on this for production without further hardening and a security review.

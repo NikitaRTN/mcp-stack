@@ -4,7 +4,10 @@ use crate::{
     oauth_core::{Authorization, Error, Exchange, OAuthCore, Settings},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use ring::rand::{SecureRandom, SystemRandom};
+use ring::{
+    hmac,
+    rand::{SecureRandom, SystemRandom},
+};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -23,6 +26,8 @@ pub struct Config {
     pub base: String,
     pub path: String,
     pub scopes: Vec<String>,
+    /// Secret shared exclusively with a trusted HTTPS reverse proxy; None means loopback only.
+    pub proxy_key: Option<String>,
 }
 struct Pending {
     client: String,
@@ -41,6 +46,7 @@ pub struct Builtin {
     username: String,
     gate: AuthGate,
     pending: Mutex<HashMap<String, Pending>>,
+    trusted_proxy: Option<(String, hmac::Key, hmac::Tag)>,
 }
 fn hdr(name: &str, value: &str) -> Header {
     Header::from_bytes(name, value).expect("constant header or validated value")
@@ -139,19 +145,46 @@ fn nonce() -> Result<String, Error> {
 impl Builtin {
     pub fn new(config: Config) -> Result<Self, String> {
         let url = Url::parse(&config.base).map_err(|_| "invalid OAuth base")?;
-        if url.scheme() != "http"
-            || !matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
-            || url.port().is_none()
+        let normalized = url.origin().ascii_serialization();
+        if url.host_str().is_none()
             || url.path() != "/"
             || url.query().is_some()
             || url.fragment().is_some()
             || !url.username().is_empty()
             || url.password().is_some()
+            || config.base != normalized
             || !config.path.starts_with('/')
         {
-            return Err("built-in OAuth requires an explicit loopback HTTP base".into());
+            return Err("invalid OAuth base".into());
         }
-        let base = config.base.trim_end_matches('/').to_string();
+        let trusted_proxy = match (&config.proxy_key, url.scheme()) {
+            (None, "http")
+                if matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
+                    && url.port().is_some() =>
+            {
+                None
+            }
+            (Some(secret), "https")
+                if (32..=1024).contains(&secret.len())
+                    && secret
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)) =>
+            {
+                let host = config
+                    .base
+                    .strip_prefix("https://")
+                    .ok_or("invalid OAuth base")?
+                    .to_string();
+                let key = hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new())
+                    .map_err(|_| "random generator unavailable")?;
+                let tag = hmac::sign(&key, secret.as_bytes());
+                Some((host, key, tag))
+            }
+            _ => {
+                return Err("OAuth requires loopback HTTP or HTTPS with a trusted proxy key".into())
+            }
+        };
+        let base = config.base.clone();
         let resource = format!("{base}{}", config.path);
         let username = config
             .auth
@@ -179,7 +212,29 @@ impl Builtin {
             username,
             gate: AuthGate::new(password),
             pending: Mutex::new(HashMap::new()),
+            trusted_proxy,
         })
+    }
+    /// A public host is accepted only when a trusted reverse proxy supplies its secret.
+    pub fn public_host(&self) -> Option<&str> {
+        self.trusted_proxy
+            .as_ref()
+            .map(|(host, _, _)| host.as_str())
+    }
+    pub fn trusted_proxy(&self, secret: &str) -> bool {
+        self.trusted_proxy
+            .as_ref()
+            .is_some_and(|(_, key, tag)| hmac::verify(key, secret.as_bytes(), tag.as_ref()).is_ok())
+    }
+    pub fn origin(&self) -> &str {
+        &self.base
+    }
+    fn cookie_secure(&self) -> &'static str {
+        if self.trusted_proxy.is_some() {
+            "; Secure"
+        } else {
+            ""
+        }
     }
     pub fn challenge(&self, error: Option<&str>) -> String {
         let suffix = error
@@ -342,7 +397,7 @@ impl Builtin {
             return match result {
                 Ok((n, client, resource)) => {
                     let html=format!("<!doctype html><html><head><meta charset=\"utf-8\"><title>Authorize MCP client</title></head><body><h1>Authorize MCP client</h1><p>Client: {}</p><p>Resource: {}</p><p>Scopes: {}</p><form method=\"post\" action=\"/oauth/authorize\"><input type=\"hidden\" name=\"nonce\" value=\"{}\"><label>Owner password <input type=\"password\" name=\"password\" required autocomplete=\"current-password\"></label><button type=\"submit\" name=\"action\" value=\"allow\">Authorize</button><button type=\"submit\" name=\"action\" value=\"deny\" formnovalidate>Deny</button></form></body></html>",esc(&client),esc(&resource),esc(&self.scopes.join(" ")),n);
-                    let cookie=format!("mcp_oauth_nonce={n}; HttpOnly; SameSite=Strict; Path=/oauth/authorize; Max-Age=300");
+                    let cookie=format!("mcp_oauth_nonce={n}; HttpOnly; SameSite=Strict; Path=/oauth/authorize; Max-Age=300{}", self.cookie_secure());
                     let _=req.respond(Response::from_string(html).with_header(hdr("Content-Type","text/html; charset=utf-8")).with_header(hdr("Cache-Control","no-store")).with_header(hdr("Set-Cookie",&cookie)).with_header(hdr("Content-Security-Policy","default-src 'none'; form-action 'self' https: http://localhost:* http://127.0.0.1:*; base-uri 'none'; frame-ancestors 'none'")).with_header(hdr("Referrer-Policy","no-referrer")).with_header(hdr("X-Content-Type-Options","nosniff")));
                 }
                 Err(e) => reject(req, e),
@@ -399,7 +454,7 @@ impl Builtin {
             })();
             return match result {
                 Ok(location) => {
-                    let _=req.respond(Response::empty(303).with_header(hdr("Location",&location)).with_header(hdr("Cache-Control","no-store")).with_header(hdr("Referrer-Policy","no-referrer")).with_header(hdr("Set-Cookie","mcp_oauth_nonce=; HttpOnly; SameSite=Strict; Path=/oauth/authorize; Max-Age=0")));
+                    let _=req.respond(Response::empty(303).with_header(hdr("Location",&location)).with_header(hdr("Cache-Control","no-store")).with_header(hdr("Referrer-Policy","no-referrer")).with_header(hdr("Set-Cookie",&format!("mcp_oauth_nonce=; HttpOnly; SameSite=Strict; Path=/oauth/authorize; Max-Age=0{}",self.cookie_secure()))));
                 }
                 Err(e) => reject(req, e),
             };
