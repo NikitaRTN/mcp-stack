@@ -166,6 +166,20 @@ impl StdioTransport {
         }
     }
 
+    pub(crate) fn poll(&self, timeout: Duration) -> Result<Option<Value>, &'static str> {
+        match self
+            .output
+            .lock()
+            .map_err(|_| "stdio output unavailable")?
+            .recv_timeout(timeout)
+        {
+            Ok(Ok(value)) => Ok(Some(value)),
+            Ok(Err(err)) => Err(err),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("stdio output closed"),
+        }
+    }
+
     pub fn receive(&self, timeout: Duration) -> Result<Value, &'static str> {
         self.output
             .lock()

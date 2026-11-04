@@ -72,6 +72,15 @@ fn fixture() {
                     );
                 }
                 Some("ping") => send(json!({"jsonrpc":"2.0","id":request["id"],"result":{}})),
+                Some("notifications/trigger-idle") => {
+                    send(
+                        json!({"jsonrpc":"2.0","method":"notifications/message","params":{"data":"idle"}}),
+                    );
+                    send(json!({"jsonrpc":"2.0","id":"idle-1","method":"roots/list"}));
+                    let reply: Value =
+                        serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+                    assert_eq!(reply["id"], "idle-1");
+                }
                 Some("notifications/initialized") => {}
                 _ => panic!("unexpected fixture message"),
             }
@@ -360,6 +369,89 @@ fn bridge_tests(spec: &ProcessSpec) {
     assert!(!alive(second_pid));
     let mut tail = String::new();
     assert!(std::io::Read::read_to_string(&mut stream, &mut tail).is_err());
+    // Independent GET receives unsolicited messages while POST remains usable.
+    let idle_session = initialize(&agent, &endpoint);
+    let get = || {
+        agent
+            .get(&endpoint)
+            .set("Authorization", &format!("Bearer {TOKEN}"))
+            .set("Accept", "text/event-stream")
+            .set("Mcp-Session-Id", &idle_session)
+    };
+    assert_eq!(
+        status(
+            agent
+                .get(&endpoint)
+                .set("Authorization", &format!("Bearer {TOKEN}"))
+                .set("Accept", "text/event-stream")
+                .call()
+        ),
+        400
+    );
+    assert_eq!(status(get().set("Accept", "application/json").call()), 406);
+    assert_eq!(status(get().set("Last-Event-ID", "old").call()), 400);
+    let response = get().call().unwrap();
+    let mut idle_stream = io::BufReader::new(response.into_reader());
+    line.clear();
+    idle_stream.read_line(&mut line).unwrap();
+    assert!(line.starts_with(": connected"));
+    assert_eq!(status(get().call()), 409);
+    assert_eq!(
+        status(
+            post(&agent, &endpoint, Some(&idle_session))
+                .send_json(json!({"jsonrpc":"2.0","method":"notifications/trigger-idle"}))
+        ),
+        202
+    );
+    let mut values = Vec::new();
+    while values.len() < 2 {
+        line.clear();
+        idle_stream.read_line(&mut line).unwrap();
+        if let Some(data) = line.strip_prefix("data: ") {
+            values.push(serde_json::from_str::<Value>(data).unwrap());
+        }
+    }
+    assert_eq!(values[0]["params"]["data"], "idle");
+    assert_eq!(values[1]["method"], "roots/list");
+    assert_eq!(
+        status(
+            post(&agent, &endpoint, Some(&idle_session))
+                .send_json(json!({"jsonrpc":"2.0","id":"idle-1","result":{"roots":[]}}))
+        ),
+        202
+    );
+    assert_eq!(
+        events(
+            post(&agent, &endpoint, Some(&idle_session))
+                .send_json(json!({"jsonrpc":"2.0","id":42,"method":"ping"}))
+                .unwrap()
+        )[0]["id"],
+        42
+    );
+    // Server requests produced during an active POST go to the GET stream;
+    // the POST's response must still reach its own stream.
+    let response = post(&agent, &endpoint, Some(&idle_session))
+        .send_json(json!({"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"echo"}}))
+        .unwrap();
+    loop {
+        line.clear();
+        idle_stream.read_line(&mut line).unwrap();
+        if line.contains("roots/list") {
+            break;
+        }
+    }
+    assert_eq!(
+        status(
+            post(&agent, &endpoint, Some(&idle_session))
+                .send_json(json!({"jsonrpc":"2.0","id":"server-1","result":{"roots":[]}}))
+        ),
+        202
+    );
+    assert_eq!(events(response)[0]["id"], 43);
+    assert_eq!(delete(&agent, &endpoint, &idle_session), 200);
+    drop(idle_stream);
+    // Give the GET worker time to release its stream permit after DELETE.
+    std::thread::sleep(Duration::from_millis(300));
     let sessions: Vec<String> = (0..5).map(|_| initialize(&agent, &endpoint)).collect();
     let mut streams = Vec::new();
     for id in &sessions[..4] {
@@ -571,6 +663,17 @@ fn oauth_session_isolation(spec: &ProcessSpec) {
         .build();
     let first = initialize_as(&agent, &endpoint, "oauth-principal-a");
     let second = initialize_as(&agent, &endpoint, "oauth-principal-b");
+    assert_eq!(
+        status(
+            agent
+                .get(&endpoint)
+                .set("Authorization", "Bearer oauth-principal-b")
+                .set("Accept", "text/event-stream")
+                .set("Mcp-Session-Id", &first)
+                .call()
+        ),
+        404
+    );
     // A valid token must not read, inject into or terminate another token's session.
     assert_eq!(
         status(
