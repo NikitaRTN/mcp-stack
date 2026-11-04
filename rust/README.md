@@ -15,4 +15,4 @@ On Windows use `rust\target\release\mcp-hub-rs.exe`. Set `MCP_HUB_TOKEN` in the 
 
 For a Linux container, run `docker build -f rust/Dockerfile -t mcp-hub-rs-experimental .` from the repository root. For example: `docker run --rm mcp-hub-rs-experimental --version`. The Docker build currently packages only the experimental client. A container's `127.0.0.1` is the container itself, not the host.
 
-The requested Windows UI Automation component will not be ported. All other existing features require subsequent implementation and parity/security testing before cutover.
+Windows UI Automation and ComfyUI are out of scope for the Rust port; they remain unchanged in the legacy application. All other existing features require subsequent implementation and parity/security testing before cutover. The bounded event bus is a tested internal component and is not yet connected to the panel.

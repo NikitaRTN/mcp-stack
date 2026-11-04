@@ -1,4 +1,7 @@
 //! Streamable HTTP MCP client. This is an incremental port, not yet the Hub.
+pub mod auth;
+pub mod events;
+
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
