@@ -4,6 +4,7 @@ pub mod caddy;
 pub mod events;
 pub mod inspector;
 pub mod migration;
+pub mod process;
 pub mod telemetry;
 pub mod trace;
 
