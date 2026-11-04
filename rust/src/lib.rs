@@ -13,6 +13,7 @@ pub mod oauth_introspection;
 pub mod oauth_tokens;
 pub mod process;
 pub mod server;
+pub mod simple;
 pub mod stdio;
 pub mod telemetry;
 pub mod trace;

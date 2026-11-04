@@ -4,17 +4,24 @@ use serde_json::Value;
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 2 && args[1] == "serve" {
-        return serve();
+        return serve(None);
+    }
+    if args.len() == 4 && args[1] == "serve" && args[2] == "--config" {
+        return serve(Some(&args[3]));
+    }
+    if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
+        println!("MCP Hub (experimental)\n\n  mcp-hub-rs serve --config PATH\n  mcp-hub-rs list URL\n  mcp-hub-rs call URL TOOL JSON_OBJECT\n\nSet MCP_HUB_TOKEN in the environment; optional MCP_HUB_PORT defaults to 8765.\nThe server listens on loopback. See rust/README.md for configuration and limitations.");
+        return Ok(());
     }
     if args.len() == 2 && args[1] == "--version" {
         println!(
-            "mcp-hub-rs {} (experimental MCP client)",
+            "mcp-hub-rs {} (experimental MCP hub)",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
     }
     if args.len() < 3 {
-        return Err("Usage: mcp-hub-rs list URL | call URL TOOL JSON_OBJECT\nBearer token: MCP_HUB_TOKEN environment variable".into());
+        return Err("Usage: mcp-hub-rs serve --config PATH | list URL | call URL TOOL JSON_OBJECT\nBearer token: MCP_HUB_TOKEN environment variable".into());
     }
     let token = std::env::var("MCP_HUB_TOKEN").ok();
     let mut client = Client::new(&args[2], token)?;
@@ -41,7 +48,7 @@ fn main() {
     }
 }
 
-fn serve() -> Result<(), String> {
+fn serve(simple_config: Option<&str>) -> Result<(), String> {
     use mcp_hub_rs::server::{Proxy, Settings};
     use std::sync::{atomic::AtomicBool, Arc};
     let port = std::env::var("MCP_HUB_PORT")
@@ -49,7 +56,33 @@ fn serve() -> Result<(), String> {
         .parse::<u16>()
         .map_err(|_| "invalid MCP_HUB_PORT")?;
     let db = std::env::var_os("MCP_HUB_DB").map(Into::into);
-    let (mut proxy, suffix) = if let Some(path) = std::env::var_os("MCP_HUB_STDIO_CONFIG") {
+    let (mut proxy, suffix) = if let Some(path) = simple_config {
+        if [
+            "MCP_HUB_STDIO_CONFIG",
+            "MCP_HUB_CONFIG",
+            "MCP_HUB_UPSTREAM",
+            "MCP_HUB_UPSTREAM_TOKEN",
+            "MCP_HUB_PROCESS_CONFIG",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err("--config cannot be combined with legacy route configuration".into());
+        }
+        let config_path = std::fs::canonicalize(path).map_err(|_| "cannot open hub config")?;
+        let root = config_path.parent().ok_or("invalid hub config path")?;
+        let file = std::fs::File::open(&config_path).map_err(|_| "cannot open hub config")?;
+        let (routes, processes) = mcp_hub_rs::simple::read_config(file, root)?;
+        let token = std::env::var("MCP_HUB_TOKEN").map_err(|_| "MCP_HUB_TOKEN is required")?;
+        if !processes.is_empty() {
+            std::fs::create_dir_all(root.join("logs"))
+                .map_err(|_| "cannot create log directory")?;
+        }
+        (
+            Proxy::bind_mixed(port, token, routes, processes, db)?,
+            "/mcp[/service-id]",
+        )
+    } else if let Some(path) = std::env::var_os("MCP_HUB_STDIO_CONFIG") {
         if [
             "MCP_HUB_CONFIG",
             "MCP_HUB_UPSTREAM",

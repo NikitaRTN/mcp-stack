@@ -145,6 +145,7 @@ fn main() {
     bridge_tests(&spec);
     oauth_session_isolation(&spec);
     executable_test(&spec);
+    simple_executable_test(&spec);
     let _ = std::fs::remove_file(log);
     println!("stdio transport: ok");
 }
@@ -586,6 +587,111 @@ fn executable_test(spec: &ProcessSpec) {
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(config);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn simple_executable_test(spec: &ProcessSpec) {
+    use std::process::{Command, Stdio};
+    let upstream = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let upstream_url = format!("http://{}/mcp", upstream.server_addr());
+    let server = std::thread::spawn(move || {
+        let mut req = upstream
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap()
+            .unwrap();
+        assert!(!req.headers().iter().any(|h| h.field.equiv("Authorization")));
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut req.as_reader(), &mut body).unwrap();
+        let input: Value = serde_json::from_str(&body).unwrap();
+        req.respond(
+            tiny_http::Response::from_string(
+                json!({"jsonrpc":"2.0","id":input["id"],"result":{"remote":true}}).to_string(),
+            )
+            .with_header(
+                tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+            ),
+        )
+        .unwrap();
+    });
+    let root = std::env::temp_dir().join(format!(
+        "mcp-simple-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let config = root.join("hub.json");
+    let fixture_env: BTreeMap<String, String> = spec
+        .env
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    std::fs::write(&config, json!({"services":[
+        {"id":"default","type":"stdio","command":spec.program.to_string_lossy(),"env":fixture_env},
+        {"id":"remote","type":"http","url":upstream_url}
+    ]}).to_string()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-hub-rs"));
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("MCP_HUB_") {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
+        .args(["serve", "--config"])
+        .arg(&config)
+        .env("MCP_HUB_TOKEN", TOKEN)
+        .env("MCP_HUB_PORT", port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(8))
+            .build();
+        let start = std::time::Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let session = initialize(&agent, &endpoint);
+        assert_eq!(
+            events(
+                post(&agent, &endpoint, Some(&session))
+                    .send_json(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+                    .unwrap()
+            )[0]["result"]["tools"][0]["name"],
+            "echo"
+        );
+        let remote = format!("{endpoint}/remote");
+        assert_eq!(status(agent.post(&remote).send_json(json!({}))), 401);
+        let response: Value = post(&agent, &remote, None)
+            .send_json(json!({"jsonrpc":"2.0","id":8,"method":"ping"}))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(response["result"]["remote"], true);
+        assert_eq!(delete(&agent, &endpoint, &session), 200);
+        assert!(root.join("logs/default.log").exists());
+    }));
+    let _ = child.kill();
+    let _ = child.wait();
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(root);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }

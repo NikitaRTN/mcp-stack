@@ -19,6 +19,25 @@ Windows UI Automation and ComfyUI are out of scope for the Rust port; they remai
 
 The experimental process manager tracks only processes it starts in its current lifetime, using Windows job objects or Unix process groups to terminate descendants. On Windows a child can spawn descendants before it is assigned to its job; on Unix a child can leave its process group. It does not recover processes after restart or support existing shell command formats. The experimental proxy polls managed processes for exit and cleans them up; direct library use must call the monitor or query the manager. Normal Ctrl-C and termination request shutdown; forced termination and crashes can leave Unix processes behind. It is not a production supervisor.
 
+## One-file local Hub configuration
+
+A single new JSON file can configure HTTP and native stdio services together. Create a separate folder and `hub.json` (commands are trusted; use only services you trust):
+
+```json
+{
+  "services": [
+    {"id": "default", "type": "stdio", "command": "node", "args": ["/absolute/path/to/mcp-server.js"]},
+    {"id": "remote", "type": "http", "url": "https://example.com/mcp"}
+  ]
+}
+```
+
+Set a strong random `MCP_HUB_TOKEN` in the environment and run `mcp-hub-rs serve --config /absolute/path/to/hub.json`. The first route is `http://127.0.0.1:8765/mcp`; the second is `http://127.0.0.1:8765/mcp/remote`. For any other ID the route is `/mcp/ID`. Both require the same bearer token. `MCP_HUB_PORT` changes the port. The existing `list` and `call` commands can test each route using the same environment token.
+
+On Windows, use `mcp-hub-rs.exe` and Windows absolute paths in JSON, with backslashes escaped (for example `C:\\tools\\server.js`). On either OS, the stdio command must already be installed. Optional stdio `cwd` must be absolute; `args` and an `env` object can be supplied. A child starts on MCP initialization and is terminated with its session; its stderr is written under `logs/ID.log` beside `hub.json`. Protect that directory because logs can contain sensitive data. HTTP services may add `"token_env":"NAME"` to read a separate upstream bearer token from that environment variable; HTTPS or loopback is required when a token is used. The Hub's own bearer token is never forwarded upstream. Config loading validates the file and does not start a service. Existing legacy route-config environment variables cannot be combined with `--config`.
+
+This is a simpler local starting point, **not a completed desktop panel or a production public service**. OAuth remains separately configured as described below, with the documented limitations; there is no graphical service editor or automatic Caddy lifecycle yet. Do not reuse the live installation directory or overwrite its configuration.
+
 ## Local proxy experiment
 
 Set `MCP_HUB_UPSTREAM` to an MCP HTTP(S) endpoint and `MCP_HUB_TOKEN` to a strong random access token (at least 24 visible ASCII characters), then run `mcp-hub-rs serve`. It listens only on `127.0.0.1`, port 8765 by default; `MCP_HUB_PORT` can override the port. Connect to `/mcp` with the access token as a bearer token. Set `MCP_HUB_UPSTREAM_TOKEN` separately if the upstream requires one; upstream bearer credentials require HTTPS or a loopback address. Redirects are not followed.

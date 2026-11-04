@@ -131,6 +131,16 @@ impl Proxy {
     ) -> Result<Self, String> {
         Self::bind_backends(port, access_token, specs, telemetry_db, HashMap::new())
     }
+    /// Build HTTP and owned stdio routes together; no process is launched during loading.
+    pub fn bind_mixed(
+        port: u16,
+        access_token: String,
+        specs: Vec<RouteSpec>,
+        processes: HashMap<String, ProcessSpec>,
+        telemetry_db: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        Self::bind_backends(port, access_token, specs, telemetry_db, processes)
+    }
     /// Create stdio-only routes without a dummy HTTP upstream. Loading never launches children.
     pub fn bind_stdio(
         port: u16,
@@ -182,6 +192,9 @@ impl Proxy {
                 .remove(&spec.id)
                 .map(|spec| crate::bridge::Bridge::new(spec, stdio_streams.clone()));
             let upstream = if stdio.is_some() {
+                if !spec.upstream.is_empty() || spec.upstream_token.is_some() {
+                    return Err("stdio route cannot have an HTTP upstream".into());
+                }
                 None
             } else {
                 let upstream = Url::parse(&spec.upstream).map_err(|_| "invalid upstream URL")?;
@@ -219,6 +232,9 @@ impl Proxy {
             {
                 return Err("duplicate route path".into());
             }
+        }
+        if !processes.is_empty() {
+            return Err("stdio process has no matching route".into());
         }
         let key = hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new())
             .map_err(|_| "random generator unavailable")?;
