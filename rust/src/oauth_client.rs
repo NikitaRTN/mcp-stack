@@ -30,7 +30,7 @@ fn loopback(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
-fn valid_endpoint(raw: &str) -> bool {
+pub(crate) fn valid_endpoint(raw: &str) -> bool {
     Url::parse(raw).is_ok_and(|url| {
         matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
@@ -40,10 +40,10 @@ fn valid_endpoint(raw: &str) -> bool {
             && (url.scheme() == "https" || url.host_str().is_some_and(loopback))
     })
 }
-fn valid_value(s: &str) -> bool {
+pub(crate) fn valid_value(s: &str) -> bool {
     !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control)
 }
-fn basic_component(s: &str) -> String {
+pub(crate) fn basic_component(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 impl ClientCredentials {

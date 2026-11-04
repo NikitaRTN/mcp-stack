@@ -119,6 +119,41 @@ fn serve() -> Result<(), String> {
         let route = std::env::var("MCP_HUB_OAUTH_ROUTE").unwrap_or_else(|_| "default".into());
         proxy.enable_upstream_oauth(&route, settings)?;
     }
+    let introspection_names = [
+        "MCP_HUB_INTROSPECTION_URL",
+        "MCP_HUB_INTROSPECTION_CLIENT_ID",
+        "MCP_HUB_INTROSPECTION_CLIENT_SECRET",
+        "MCP_HUB_INTROSPECTION_AUTH_METHOD",
+        "MCP_HUB_INTROSPECTION_REQUIRED_SCOPES",
+        "MCP_HUB_INTROSPECTION_AUDIENCE",
+        "MCP_HUB_INTROSPECTION_ISSUER",
+        "MCP_HUB_INTROSPECTION_ROUTE",
+    ];
+    if introspection_names
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        let required = |name| {
+            std::env::var(name).map_err(|_| "incomplete inbound introspection configuration")
+        };
+        let settings = mcp_hub_rs::oauth_introspection::Settings {
+            endpoint: required("MCP_HUB_INTROSPECTION_URL")?,
+            client_id: required("MCP_HUB_INTROSPECTION_CLIENT_ID")?,
+            client_secret: required("MCP_HUB_INTROSPECTION_CLIENT_SECRET")?,
+            auth_method: std::env::var("MCP_HUB_INTROSPECTION_AUTH_METHOD")
+                .unwrap_or_else(|_| "basic".into()),
+            required_scopes: std::env::var("MCP_HUB_INTROSPECTION_REQUIRED_SCOPES")
+                .unwrap_or_default()
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect(),
+            audience: std::env::var("MCP_HUB_INTROSPECTION_AUDIENCE").ok(),
+            issuer: std::env::var("MCP_HUB_INTROSPECTION_ISSUER").ok(),
+        };
+        let route =
+            std::env::var("MCP_HUB_INTROSPECTION_ROUTE").unwrap_or_else(|_| "default".into());
+        proxy.enable_inbound_oauth(&route, settings)?;
+    }
     match (
         std::env::var_os("MCP_HUB_PROCESS_CONFIG"),
         std::env::var("MCP_HUB_ADMIN_TOKEN").ok(),

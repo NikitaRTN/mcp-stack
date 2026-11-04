@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -35,6 +35,7 @@ struct Route {
     upstream: Option<Url>,
     upstream_token: Option<String>,
     oauth: Option<crate::oauth_client::ClientCredentials>,
+    inbound_oauth: Option<crate::oauth_introspection::Introspection>,
     stdio: Option<crate::bridge::Bridge>,
 }
 struct Management {
@@ -44,6 +45,7 @@ struct Management {
     processes: ProcessManager,
 }
 pub struct Proxy {
+    stdio_streams: Arc<AtomicUsize>,
     management: Option<Management>,
     server: Arc<Server>,
     address: SocketAddr,
@@ -88,6 +90,14 @@ fn header(req: &Request, name: &'static str) -> Result<Option<String>, ()> {
         }
     }
     Ok(found)
+}
+fn oauth_denied(req: Request, code: u16, challenge: &'static str) {
+    let _ = req.respond(
+        Response::from_string("OAuth access denied")
+            .with_status_code(code)
+            .with_header(Header::from_bytes("WWW-Authenticate", challenge).unwrap())
+            .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap()),
+    );
 }
 fn reply(req: Request, status: u16, message: &'static str) {
     let body = serde_json::json!({"error":message}).to_string();
@@ -155,6 +165,7 @@ impl Proxy {
         if specs.is_empty() || specs.len() > 100 {
             return Err("invalid number of routes".into());
         }
+        let stdio_streams = Arc::new(AtomicUsize::new(0));
         let mut routes = HashMap::new();
         let mut ids = std::collections::HashSet::new();
         for spec in specs {
@@ -166,7 +177,9 @@ impl Proxy {
             }) {
                 return Err("invalid upstream token".into());
             }
-            let stdio = processes.remove(&spec.id).map(crate::bridge::Bridge::new);
+            let stdio = processes
+                .remove(&spec.id)
+                .map(|spec| crate::bridge::Bridge::new(spec, stdio_streams.clone()));
             let upstream = if stdio.is_some() {
                 None
             } else {
@@ -197,6 +210,7 @@ impl Proxy {
                         upstream,
                         upstream_token: spec.upstream_token,
                         oauth: None,
+                        inbound_oauth: None,
                         stdio,
                     },
                 )
@@ -232,6 +246,7 @@ impl Proxy {
             .timeout_read(Duration::from_secs(60))
             .build();
         Ok(Self {
+            stdio_streams,
             management: None,
             server: Arc::new(server),
             address,
@@ -256,8 +271,25 @@ impl Proxy {
         {
             return Err("incompatible stdio route configuration".into());
         }
-        route.stdio = Some(crate::bridge::Bridge::new(spec));
+        route.stdio = Some(crate::bridge::Bridge::new(spec, self.stdio_streams.clone()));
         route.upstream = None;
+        Ok(())
+    }
+    /// Replace static bearer access on one route with external introspection; never a fallback.
+    pub fn enable_inbound_oauth(
+        &mut self,
+        id: &str,
+        settings: crate::oauth_introspection::Settings,
+    ) -> Result<(), String> {
+        let route = self
+            .routes
+            .values_mut()
+            .find(|r| r.id == id)
+            .ok_or("unknown inbound OAuth route")?;
+        if route.inbound_oauth.is_some() {
+            return Err("inbound OAuth already configured".into());
+        }
+        route.inbound_oauth = Some(crate::oauth_introspection::Introspection::new(settings)?);
         Ok(())
     }
     /// Enable client-credentials auth for one preconfigured route before running the proxy.
@@ -438,12 +470,34 @@ impl Proxy {
         }
         let authorization = match header(&req, "Authorization") {
             Ok(Some(v)) => v,
+            _ if self
+                .routes
+                .get(req.url())
+                .is_some_and(|r| r.inbound_oauth.is_some()) =>
+            {
+                return oauth_denied(req, 401, "Bearer");
+            }
             _ => return reply(req, 401, "unauthorized"),
         };
         if req.url().starts_with("/_hub/") || req.url() == "/_hub" {
             return self.handle_management(req, &authorization);
         }
-        if hmac::verify(
+        if let Some(oauth) = self
+            .routes
+            .get(req.url())
+            .and_then(|r| r.inbound_oauth.as_ref())
+        {
+            if let Err(denied) = oauth.validate(&authorization) {
+                use crate::oauth_introspection::Denied;
+                let (code, challenge) = match denied {
+                    Denied::Invalid => (401, "Bearer error=\"invalid_token\""),
+                    Denied::Scope => (403, "Bearer error=\"insufficient_scope\""),
+                    Denied::Unavailable => return reply(req, 503, "OAuth validation unavailable"),
+                };
+                oauth_denied(req, code, challenge);
+                return;
+            }
+        } else if hmac::verify(
             &self.auth_key,
             authorization.as_bytes(),
             self.auth_digest.as_ref(),
@@ -456,7 +510,15 @@ impl Proxy {
             return reply(req, 404, "not found");
         };
         if let Some(bridge) = &route.stdio {
-            return bridge.handle(req);
+            // Bind stdio sessions to the validated bearer credential, never a caller-provided ID alone.
+            let token = authorization
+                .split_once(' ')
+                .map(|(_, token)| token)
+                .unwrap_or("");
+            let hash = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+            let mut owner = [0u8; 32];
+            owner.copy_from_slice(hash.as_ref());
+            return bridge.handle(req, owner);
         }
         let method = match req.method() {
             Method::Post => "POST",

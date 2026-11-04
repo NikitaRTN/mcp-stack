@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     io::{self, Read},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -17,12 +17,15 @@ const MAX_BODY: u64 = 4_000_000;
 const MAX_SESSIONS: usize = 16;
 const IDLE: Duration = Duration::from_secs(900);
 struct Session {
+    owner: [u8; 32],
     transport: StdioTransport,
     busy: AtomicBool,
     closed: AtomicBool,
     touched: Mutex<Instant>,
 }
 pub struct Bridge {
+    stopped: AtomicBool,
+    stream_budget: Arc<AtomicUsize>,
     spec: ProcessSpec,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
 }
@@ -49,13 +52,16 @@ fn id() -> Result<String, &'static str> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 impl Bridge {
-    pub fn new(spec: ProcessSpec) -> Self {
+    pub(crate) fn new(spec: ProcessSpec, stream_budget: Arc<AtomicUsize>) -> Self {
         Self {
+            stopped: AtomicBool::new(false),
+            stream_budget,
             spec,
             sessions: Mutex::new(HashMap::new()),
         }
     }
     pub fn shutdown(&self) {
+        self.stopped.store(true, Ordering::Release);
         if let Ok(mut sessions) = self.sessions.lock() {
             for session in sessions.values() {
                 session.closed.store(true, Ordering::Release);
@@ -81,7 +87,10 @@ impl Bridge {
             });
         }
     }
-    pub fn handle(&self, mut req: Request) {
+    pub fn handle(&self, mut req: Request, owner: [u8; 32]) {
+        if self.stopped.load(Ordering::Acquire) {
+            return error(req, 503, "bridge shutting down");
+        }
         let session_id = match header(&req, "Mcp-Session-Id") {
             Ok(value) => value,
             Err(_) => return error(req, 400, "duplicate session header"),
@@ -98,11 +107,13 @@ impl Bridge {
             let Some(id) = session_id else {
                 return error(req, 400, "session required");
             };
-            let removed = self
-                .sessions
-                .lock()
-                .ok()
-                .and_then(|mut map| map.remove(&id));
+            let removed = self.sessions.lock().ok().and_then(|mut map| {
+                if map.get(&id).is_some_and(|s| s.owner == owner) {
+                    map.remove(&id)
+                } else {
+                    None
+                }
+            });
             return if let Some(session) = removed {
                 session.closed.store(true, Ordering::Release);
                 let _ = session.transport.shutdown();
@@ -176,6 +187,15 @@ impl Bridge {
             return error(req, 400, "initialize must be a single request");
         }
         let creating = session_id.is_none();
+        // Keep HTTP workers available for server-request replies and DELETE even under load.
+        let permit = if is_request {
+            match StreamPermit::acquire(self.stream_budget.clone()) {
+                Some(permit) => Some(permit),
+                None => return error(req, 503, "active stream limit reached"),
+            }
+        } else {
+            None
+        };
         let (session_id, session) = if let Some(id) = session_id {
             let session = self
                 .sessions
@@ -185,6 +205,9 @@ impl Bridge {
             let Some(session) = session else {
                 return error(req, 404, "session not found");
             };
+            if session.owner != owner {
+                return error(req, 404, "session not found");
+            }
             if session.closed.load(Ordering::Acquire) {
                 return error(req, 404, "session closed");
             }
@@ -199,6 +222,9 @@ impl Bridge {
             let Ok(mut sessions) = self.sessions.lock() else {
                 return error(req, 503, "session store unavailable");
             };
+            if self.stopped.load(Ordering::Acquire) {
+                return error(req, 503, "bridge shutting down");
+            }
             if sessions.len() >= MAX_SESSIONS {
                 return error(req, 503, "session limit reached");
             }
@@ -212,6 +238,7 @@ impl Bridge {
                 return error(req, 502, "cannot start stdio process");
             };
             let session = Arc::new(Session {
+                owner,
                 transport,
                 busy: AtomicBool::new(true),
                 closed: AtomicBool::new(false),
@@ -248,6 +275,7 @@ impl Bridge {
             return error(req, 505, "SSE requires HTTP/1.1");
         }
         let mut stream = Events {
+            _permit: permit,
             session,
             request_ids,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -267,7 +295,24 @@ impl Bridge {
         }
     }
 }
+struct StreamPermit(Arc<AtomicUsize>);
+impl StreamPermit {
+    fn acquire(budget: Arc<AtomicUsize>) -> Option<Self> {
+        budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < 4).then_some(n + 1)
+            })
+            .ok()?;
+        Some(Self(budget))
+    }
+}
+impl Drop for StreamPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 struct Events {
+    _permit: Option<StreamPermit>,
     session: Arc<Session>,
     request_ids: Vec<Value>,
     deadline: Instant,

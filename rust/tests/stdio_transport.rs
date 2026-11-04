@@ -19,6 +19,7 @@ fn fixture() {
         "MCP_HUB_ADMIN_TOKEN",
         "MCP_HUB_UPSTREAM_TOKEN",
         "MCP_HUB_OAUTH_CLIENT_SECRET",
+        "MCP_HUB_INTROSPECTION_CLIENT_SECRET",
     ] {
         assert!(
             std::env::var_os(name).is_none(),
@@ -124,6 +125,7 @@ fn main() {
     drop(session);
     failure_tests(&spec);
     bridge_tests(&spec);
+    oauth_session_isolation(&spec);
     executable_test(&spec);
     let _ = std::fs::remove_file(log);
     println!("stdio transport: ok");
@@ -180,7 +182,10 @@ fn events(response: ureq::Response) -> Vec<Value> {
         .collect()
 }
 fn initialize(agent: &ureq::Agent, endpoint: &str) -> String {
-    let response = post(agent, endpoint, None).send_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).unwrap();
+    initialize_as(agent, endpoint, TOKEN)
+}
+fn initialize_as(agent: &ureq::Agent, endpoint: &str, token: &str) -> String {
+    let response = post(agent, endpoint, None).set("Authorization", &format!("Bearer {token}")).send_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).unwrap();
     let session = response.header("Mcp-Session-Id").unwrap().to_owned();
     assert_eq!(session.len(), 64);
     let messages = events(response);
@@ -190,6 +195,7 @@ fn initialize(agent: &ureq::Agent, endpoint: &str) -> String {
     assert_eq!(
         status(
             post(agent, endpoint, Some(&session))
+                .set("Authorization", &format!("Bearer {token}"))
                 .send_json(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
         ),
         202
@@ -345,6 +351,42 @@ fn bridge_tests(spec: &ProcessSpec) {
     assert!(!alive(second_pid));
     let mut tail = String::new();
     assert!(std::io::Read::read_to_string(&mut stream, &mut tail).is_err());
+    let sessions: Vec<String> = (0..5).map(|_| initialize(&agent, &endpoint)).collect();
+    let mut streams = Vec::new();
+    for id in &sessions[..4] {
+        let response = post(&agent, &endpoint, Some(id))
+            .send_json(
+                json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"echo"}}),
+            )
+            .unwrap();
+        let mut stream = io::BufReader::new(response.into_reader());
+        line.clear();
+        stream.read_line(&mut line).unwrap();
+        assert!(line.contains("roots/list"));
+        streams.push(stream);
+    }
+    assert_eq!(
+        status(
+            post(&agent, &endpoint, Some(&sessions[4]))
+                .send_json(json!({"jsonrpc":"2.0","id":21,"method":"ping"}))
+        ),
+        503
+    );
+    for (id, mut stream) in sessions.iter().zip(streams) {
+        assert_eq!(
+            status(
+                post(&agent, &endpoint, Some(id))
+                    .send_json(json!({"jsonrpc":"2.0","id":"server-1","result":{"roots":[]}}))
+            ),
+            202
+        );
+        let mut tail = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut tail).unwrap();
+        assert!(tail.contains("ok"));
+    }
+    for id in &sessions {
+        assert_eq!(delete(&agent, &endpoint, id), 200);
+    }
     let active = initialize(&agent, &endpoint);
     let active_pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
     let response = post(&agent, &endpoint, Some(&active))
@@ -393,6 +435,14 @@ fn executable_test(spec: &ProcessSpec) {
         "MCP_HUB_OAUTH_AUDIENCE",
         "MCP_HUB_OAUTH_AUTH_METHOD",
         "MCP_HUB_OAUTH_ROUTE",
+        "MCP_HUB_INTROSPECTION_URL",
+        "MCP_HUB_INTROSPECTION_CLIENT_ID",
+        "MCP_HUB_INTROSPECTION_CLIENT_SECRET",
+        "MCP_HUB_INTROSPECTION_AUTH_METHOD",
+        "MCP_HUB_INTROSPECTION_REQUIRED_SCOPES",
+        "MCP_HUB_INTROSPECTION_AUDIENCE",
+        "MCP_HUB_INTROSPECTION_ISSUER",
+        "MCP_HUB_INTROSPECTION_ROUTE",
     ] {
         process.env_remove(name);
     }
@@ -459,4 +509,100 @@ fn alive(pid: u32) -> bool {
 fn alive(pid: u32) -> bool {
     // SAFETY: signal zero only queries existence of the fixture PID.
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn oauth_session_isolation(spec: &ProcessSpec) {
+    use mcp_hub_rs::{oauth_introspection::Settings, server::Proxy};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let introspector = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/introspect", introspector.server_addr());
+    let provider = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let req = introspector
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            req.respond(tiny_http::Response::from_string(json!({"active":true,"scope":"mcp:use","exp":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()+120}).to_string())).unwrap();
+        }
+    });
+    let mut proxy = Proxy::bind_stdio(
+        0,
+        TOKEN.into(),
+        std::collections::HashMap::from([("default".into(), spec.clone())]),
+        None,
+    )
+    .unwrap();
+    proxy
+        .enable_inbound_oauth(
+            "default",
+            Settings {
+                endpoint: url,
+                client_id: "fixture".into(),
+                client_secret: "fixture-secret".into(),
+                auth_method: "basic".into(),
+                required_scopes: vec!["mcp:use".into()],
+                audience: None,
+                issuer: None,
+            },
+        )
+        .unwrap();
+    let proxy = Arc::new(proxy);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (p, s) = (proxy.clone(), stop.clone());
+    let worker = std::thread::spawn(move || p.run(s).unwrap());
+    let endpoint = format!("http://{}/mcp", proxy.address());
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(8))
+        .build();
+    let first = initialize_as(&agent, &endpoint, "oauth-principal-a");
+    let second = initialize_as(&agent, &endpoint, "oauth-principal-b");
+    // A valid token must not read, inject into or terminate another token's session.
+    assert_eq!(
+        status(
+            post(&agent, &endpoint, Some(&first))
+                .set("Authorization", "Bearer oauth-principal-b")
+                .send_json(json!({"jsonrpc":"2.0","id":10,"method":"ping"}))
+        ),
+        404
+    );
+    assert_eq!(
+        status(
+            agent
+                .delete(&endpoint)
+                .set("Authorization", "Bearer oauth-principal-b")
+                .set("Mcp-Session-Id", &first)
+                .call()
+        ),
+        404
+    );
+    assert_eq!(
+        events(
+            post(&agent, &endpoint, Some(&first))
+                .set("Authorization", "Bearer oauth-principal-a")
+                .send_json(json!({"jsonrpc":"2.0","id":11,"method":"ping"}))
+                .unwrap()
+        )[0]["id"],
+        11
+    );
+    for (session, token) in [
+        (&first, "oauth-principal-a"),
+        (&second, "oauth-principal-b"),
+    ] {
+        assert_eq!(
+            status(
+                agent
+                    .delete(&endpoint)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Mcp-Session-Id", session)
+                    .call()
+            ),
+            200
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    provider.join().unwrap();
 }

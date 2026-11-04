@@ -78,6 +78,7 @@ impl StdioTransport {
             .env_remove("MCP_HUB_ADMIN_TOKEN")
             .env_remove("MCP_HUB_UPSTREAM_TOKEN")
             .env_remove("MCP_HUB_OAUTH_CLIENT_SECRET")
+            .env_remove("MCP_HUB_INTROSPECTION_CLIENT_SECRET")
             .envs(&spec.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
