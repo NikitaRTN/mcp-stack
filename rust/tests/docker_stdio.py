@@ -49,6 +49,7 @@ def main():
     name = "mcp-stdio-ci-" + uuid.uuid4().hex[:12]
     with tempfile.TemporaryDirectory(prefix="mcp-stdio-") as folder:
         root = Path(folder)
+        root.chmod(0o755)  # The container deliberately runs as an unprivileged UID.
         (root / "server.sh").write_text(SCRIPT, encoding="utf-8")
         (root / "config.json").write_text(json.dumps({"services": [{"id": "default", "program": "/bin/sh", "args": ["/fixtures/server.sh"], "log": "/tmp/stdio-fixture.log"}]}), encoding="utf-8")
         subprocess.run(["docker", "run", "--rm", "-d", "--name", name, "--network", "host", "-v", f"{root}:/fixtures:ro", "-e", f"MCP_HUB_PORT={PORT}", "-e", f"MCP_HUB_TOKEN={TOKEN}", "-e", "MCP_HUB_STDIO_CONFIG=/fixtures/config.json", "mcp-hub-rs-experimental", "serve"], check=True, stdout=subprocess.DEVNULL)
