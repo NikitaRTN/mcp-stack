@@ -24,3 +24,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"
+
+
+[[test]]
+name = "stdio_transport"
+path = "tests/stdio_transport.rs"
+harness = false

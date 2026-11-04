@@ -32,9 +32,10 @@ pub struct RouteSpec {
 }
 struct Route {
     id: String,
-    upstream: Url,
+    upstream: Option<Url>,
     upstream_token: Option<String>,
     oauth: Option<crate::oauth_client::ClientCredentials>,
+    stdio: Option<crate::bridge::Bridge>,
 }
 struct Management {
     key: hmac::Key,
@@ -117,6 +118,37 @@ impl Proxy {
         specs: Vec<RouteSpec>,
         telemetry_db: Option<PathBuf>,
     ) -> Result<Self, String> {
+        Self::bind_backends(port, access_token, specs, telemetry_db, HashMap::new())
+    }
+    /// Create stdio-only routes without a dummy HTTP upstream. Loading never launches children.
+    pub fn bind_stdio(
+        port: u16,
+        access_token: String,
+        processes: HashMap<String, ProcessSpec>,
+        telemetry_db: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let specs = processes
+            .keys()
+            .map(|id| RouteSpec {
+                id: id.clone(),
+                path: if id == "default" {
+                    "/mcp".into()
+                } else {
+                    format!("/mcp/{id}")
+                },
+                upstream: String::new(),
+                upstream_token: None,
+            })
+            .collect();
+        Self::bind_backends(port, access_token, specs, telemetry_db, processes)
+    }
+    fn bind_backends(
+        port: u16,
+        access_token: String,
+        specs: Vec<RouteSpec>,
+        telemetry_db: Option<PathBuf>,
+        mut processes: HashMap<String, ProcessSpec>,
+    ) -> Result<Self, String> {
         if !valid_token(&access_token) {
             return Err("MCP_HUB_TOKEN must contain 24-1024 visible ASCII characters".into());
         }
@@ -134,23 +166,29 @@ impl Proxy {
             }) {
                 return Err("invalid upstream token".into());
             }
-            let upstream = Url::parse(&spec.upstream).map_err(|_| "invalid upstream URL")?;
-            if !matches!(upstream.scheme(), "http" | "https")
-                || upstream.host_str().is_none()
-                || !upstream.username().is_empty()
-                || upstream.password().is_some()
-                || upstream.fragment().is_some()
-            {
-                return Err(
-                    "upstream must be an HTTP(S) URL without credentials or fragment".into(),
-                );
-            }
-            if spec.upstream_token.is_some()
-                && upstream.scheme() != "https"
-                && !loopback_host(upstream.host_str().unwrap_or_default())
-            {
-                return Err("upstream bearer token requires HTTPS or loopback".into());
-            }
+            let stdio = processes.remove(&spec.id).map(crate::bridge::Bridge::new);
+            let upstream = if stdio.is_some() {
+                None
+            } else {
+                let upstream = Url::parse(&spec.upstream).map_err(|_| "invalid upstream URL")?;
+                if !matches!(upstream.scheme(), "http" | "https")
+                    || upstream.host_str().is_none()
+                    || !upstream.username().is_empty()
+                    || upstream.password().is_some()
+                    || upstream.fragment().is_some()
+                {
+                    return Err(
+                        "upstream must be an HTTP(S) URL without credentials or fragment".into(),
+                    );
+                }
+                if spec.upstream_token.is_some()
+                    && upstream.scheme() != "https"
+                    && !loopback_host(upstream.host_str().unwrap_or_default())
+                {
+                    return Err("upstream bearer token requires HTTPS or loopback".into());
+                }
+                Some(upstream)
+            };
             if routes
                 .insert(
                     spec.path,
@@ -159,6 +197,7 @@ impl Proxy {
                         upstream,
                         upstream_token: spec.upstream_token,
                         oauth: None,
+                        stdio,
                     },
                 )
                 .is_some()
@@ -180,8 +219,10 @@ impl Proxy {
             .to_ip()
             .ok_or("invalid server address")?;
         if routes.values().any(|route| {
-            route.upstream.host_str().is_some_and(loopback_host)
-                && route.upstream.port_or_known_default() == Some(address.port())
+            route.upstream.as_ref().is_some_and(|upstream| {
+                upstream.host_str().is_some_and(loopback_host)
+                    && upstream.port_or_known_default() == Some(address.port())
+            })
         }) {
             return Err("upstream points to proxy listener".into());
         }
@@ -201,6 +242,24 @@ impl Proxy {
             telemetry,
         })
     }
+    /// Attach a native stdio adapter to one route before running the proxy.
+    pub fn enable_stdio(&mut self, id: &str, spec: ProcessSpec) -> Result<(), String> {
+        let route = self
+            .routes
+            .values_mut()
+            .find(|r| r.id == id)
+            .ok_or("unknown stdio route")?;
+        if route.stdio.is_some()
+            || route.oauth.is_some()
+            || route.upstream_token.is_some()
+            || spec.program.is_empty()
+        {
+            return Err("incompatible stdio route configuration".into());
+        }
+        route.stdio = Some(crate::bridge::Bridge::new(spec));
+        route.upstream = None;
+        Ok(())
+    }
     /// Enable client-credentials auth for one preconfigured route before running the proxy.
     pub fn enable_upstream_oauth(
         &mut self,
@@ -214,8 +273,10 @@ impl Proxy {
             .ok_or("unknown OAuth route")?;
         if route.upstream_token.is_some()
             || route.oauth.is_some()
-            || (route.upstream.scheme() != "https"
-                && !route.upstream.host_str().is_some_and(loopback_host))
+            || route.stdio.is_some()
+            || route.upstream.as_ref().is_none_or(|upstream| {
+                upstream.scheme() != "https" && !upstream.host_str().is_some_and(loopback_host)
+            })
         {
             return Err("OAuth upstream must use HTTPS or loopback and no other credential".into());
         }
@@ -266,24 +327,31 @@ impl Proxy {
     }
     pub fn run(self: Arc<Self>, shutdown: Arc<AtomicBool>) -> Result<(), String> {
         let mut workers = Vec::new();
-        if self.management.is_some() {
+        if self.management.is_some() || self.routes.values().any(|route| route.stdio.is_some()) {
             let proxy = self.clone();
             let stop = shutdown.clone();
             workers.push(std::thread::spawn(move || {
                 let mut reported = false;
                 while !stop.load(Ordering::Relaxed) {
+                    for route in proxy.routes.values() {
+                        if let Some(bridge) = &route.stdio {
+                            bridge.reap();
+                        }
+                    }
                     let failed = proxy
                         .management
                         .as_ref()
-                        .unwrap()
-                        .processes
-                        .reap_exited()
-                        .is_err();
+                        .is_some_and(|m| m.processes.reap_exited().is_err());
                     if failed && !reported {
                         eprintln!("process monitor failed; retrying");
                     }
                     reported = failed;
                     std::thread::sleep(Duration::from_millis(200));
+                }
+                for route in proxy.routes.values() {
+                    if let Some(bridge) = &route.stdio {
+                        bridge.shutdown();
+                    }
                 }
             }));
         }
@@ -387,6 +455,9 @@ impl Proxy {
         let Some(route) = self.routes.get(req.url()) else {
             return reply(req, 404, "not found");
         };
+        if let Some(bridge) = &route.stdio {
+            return bridge.handle(req);
+        }
         let method = match req.method() {
             Method::Post => "POST",
             Method::Get => "GET",
@@ -460,7 +531,10 @@ impl Proxy {
                 }
             }
         }
-        let mut upstream = self.agent.request(method, route.upstream.as_str());
+        let Some(endpoint) = &route.upstream else {
+            return reply(req, 503, "route unavailable");
+        };
+        let mut upstream = self.agent.request(method, endpoint.as_str());
         for (name, value) in &forwarded {
             upstream = upstream.set(name, value);
         }
@@ -682,7 +756,7 @@ impl<R: Read> Drop for Observed<R> {
 }
 
 // tiny_http buffers its response writer, so SSE must be flushed after every chunk.
-fn send_sse<R: Read, W: Write>(
+pub(crate) fn send_sse<R: Read, W: Write>(
     writer: &mut W,
     status: u16,
     headers: &[Header],

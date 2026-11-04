@@ -49,7 +49,28 @@ fn serve() -> Result<(), String> {
         .parse::<u16>()
         .map_err(|_| "invalid MCP_HUB_PORT")?;
     let db = std::env::var_os("MCP_HUB_DB").map(Into::into);
-    let (mut proxy, suffix) = if let Some(path) = std::env::var_os("MCP_HUB_CONFIG") {
+    let (mut proxy, suffix) = if let Some(path) = std::env::var_os("MCP_HUB_STDIO_CONFIG") {
+        if [
+            "MCP_HUB_CONFIG",
+            "MCP_HUB_UPSTREAM",
+            "MCP_HUB_UPSTREAM_TOKEN",
+            "MCP_HUB_PROCESS_CONFIG",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err(
+                "stdio config cannot be combined with HTTP or managed-process configuration".into(),
+            );
+        }
+        let file = std::fs::File::open(path).map_err(|_| "cannot open stdio config")?;
+        let specs = mcp_hub_rs::managed::read_config(file)?;
+        let token = std::env::var("MCP_HUB_TOKEN").map_err(|_| "MCP_HUB_TOKEN is required")?;
+        (
+            Proxy::bind_stdio(port, token, specs, db)?,
+            "/mcp[/service-id]",
+        )
+    } else if let Some(path) = std::env::var_os("MCP_HUB_CONFIG") {
         if std::env::var_os("MCP_HUB_UPSTREAM").is_some()
             || std::env::var_os("MCP_HUB_UPSTREAM_TOKEN").is_some()
         {

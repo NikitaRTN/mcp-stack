@@ -1,5 +1,6 @@
 //! Streamable HTTP MCP client. This is an incremental port, not yet the Hub.
 pub mod auth;
+pub mod bridge;
 pub mod caddy;
 pub mod events;
 pub mod inspector;
@@ -8,6 +9,7 @@ pub mod migration;
 pub mod oauth_client;
 pub mod process;
 pub mod server;
+pub mod stdio;
 pub mod telemetry;
 pub mod trace;
 mod tree;
