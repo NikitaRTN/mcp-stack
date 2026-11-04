@@ -476,8 +476,18 @@ impl<R: Read> Read for Observed<R> {
         match self.inner.read(buffer) {
             Ok(n) => {
                 if n == 0 {
+                    if buffer.is_empty() {
+                        return Ok(0);
+                    }
+                    if self.expected.is_some_and(|len| self.bytes < len as u64) {
+                        self.failed = true;
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "incomplete upstream response",
+                        ));
+                    }
                     self.complete = true;
-                    return Ok(n);
+                    return Ok(0);
                 }
                 self.bytes = self.bytes.saturating_add(n as u64);
                 if self.is_sse {
@@ -646,4 +656,32 @@ pub fn legacy_routes(reader: impl Read) -> Result<(String, Vec<RouteSpec>), Stri
         return Err("no supported enabled legacy services".into());
     }
     Ok((token, routes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn truncated_upstream_body_is_not_completed() {
+        let mut observed = Observed {
+            inner: io::Cursor::new(b"short"),
+            store: None,
+            pending: Vec::new(),
+            scanner: SseScanner::default(),
+            json: Vec::new(),
+            is_sse: false,
+            bytes: 0,
+            expected: Some(10),
+            complete: false,
+            failed: false,
+            status: 200,
+        };
+        let mut buffer = Vec::new();
+        assert_eq!(
+            observed.read_to_end(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(!observed.complete);
+        assert!(observed.failed);
+    }
 }
