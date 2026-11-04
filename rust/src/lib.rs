@@ -1,6 +1,8 @@
 //! Streamable HTTP MCP client. This is an incremental port, not yet the Hub.
 pub mod auth;
+pub mod caddy;
 pub mod events;
+pub mod inspector;
 pub mod migration;
 
 use serde_json::{json, Value};

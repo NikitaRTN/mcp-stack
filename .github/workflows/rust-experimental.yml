@@ -26,6 +26,20 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Install pinned Caddy for routing tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/caddy"
+          cd "$RUNNER_TEMP/caddy"
+          base=https://github.com/caddyserver/caddy/releases/download/v2.11.4
+          curl --fail --silent --show-error --location --retry 3 "$base/caddy_2.11.4_linux_amd64.tar.gz" -o caddy.tar.gz
+          curl --fail --silent --show-error --location --retry 3 "$base/caddy_2.11.4_checksums.txt" -o checksums.txt
+          expected=$(grep ' caddy_2.11.4_linux_amd64.tar.gz$' checksums.txt | awk '{print $1}')
+          test -n "$expected"
+          echo "$expected  caddy.tar.gz" | sha256sum --check --status
+          tar -xzf caddy.tar.gz caddy
+          echo "CADDY_TEST_BIN=$RUNNER_TEMP/caddy/caddy" >> "$GITHUB_ENV"
       - name: Tests
         run: cargo test --locked --all-targets
       - name: Release build
